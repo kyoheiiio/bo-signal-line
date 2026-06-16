@@ -4,7 +4,7 @@ import os
 
 app = Flask(__name__)
 
-LINE_ACCESS_TOKEN = "ここに新しいチャネルアクセストークン"
+LINE_ACCESS_TOKEN = "ZywFkUxi1uE39Xz7Lz3DVlIP7+wglkcExamcrGg4Hr7l4b6xL5HpBMzYMMDYhfERCHpjaiOd9+KreSwxD0Q6WgGpgosWw56k0o1+2k30hI8NM4BU3Yqh7Hs8kwuy5W2YKEflGnCxT2ryRwSjer7EEAdB04t89/1O/w1cDnyilFU="
 
 def send_line_message(message):
     url = "https://api.line.me/v2/bot/message/broadcast"
