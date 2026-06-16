@@ -1,6 +1,29 @@
 from flask import Flask, request
+import requests
+import os
 
 app = Flask(__name__)
+
+LINE_ACCESS_TOKEN = "ここに新しいチャネルアクセストークン"
+
+def send_line_message(message):
+    url = "https://api.line.me/v2/bot/message/broadcast"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
+    }
+
+    data = {
+        "messages": [
+            {
+                "type": "text",
+                "text": message
+            }
+        ]
+    }
+
+    requests.post(url, headers=headers, json=data)
 
 @app.route("/")
 def home():
@@ -9,7 +32,21 @@ def home():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
-    print(data)
+
+    signal = data.get("signal", "SIGNAL")
+    pair = data.get("pair", "UNKNOWN")
+    timeframe = data.get("timeframe", "UNKNOWN")
+
+    message = f"""
+📈 BO SIGNAL
+
+通貨: {pair}
+足種: {timeframe}
+シグナル: {signal}
+"""
+
+    send_line_message(message)
+
     return "OK"
 
 if __name__ == "__main__":
