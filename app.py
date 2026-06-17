@@ -21,43 +21,24 @@ SYMBOL = "USD/JPY"
 
 def send_line_message(message):
     url = "https://api.line.me/v2/bot/message/broadcast"
-
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
     }
-
-    payload = {
-        "messages": [
-            {
-                "type": "text",
-                "text": message
-            }
-        ]
-    }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=10
-    )
-
+    payload = {"messages": [{"type": "text", "text": message}]}
+    response = requests.post(url, headers=headers, json=payload, timeout=10)
     print("LINE STATUS:", response.status_code)
     print("LINE RESPONSE:", response.text)
 
 
 def get_usdjpy_price():
     url = "https://api.twelvedata.com/price"
-
     params = {
         "symbol": SYMBOL,
         "apikey": TWELVE_DATA_API_KEY
     }
-
     response = requests.get(url, params=params, timeout=10)
     data = response.json()
-
     print("PRICE RESPONSE:", data)
 
     if "price" not in data:
@@ -85,7 +66,6 @@ def get_sheet():
 
 def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
     sheet = get_sheet()
-
     now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
     row = [
@@ -101,7 +81,6 @@ def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
     ]
 
     sheet.append_row(row, value_input_option="USER_ENTERED")
-
     row_number = len(sheet.get_all_values())
 
     print("SHEET APPENDED ROW:", row_number)
@@ -113,6 +92,13 @@ def update_entry_price(row_number, entry_price):
     sheet = get_sheet()
     sheet.update_cell(row_number, 6, entry_price)
     print("ENTRY PRICE UPDATED:", entry_price)
+
+
+def update_cancel(row_number, entry_price):
+    sheet = get_sheet()
+    sheet.update_cell(row_number, 6, entry_price)
+    sheet.update_cell(row_number, 9, "CANCEL")
+    print("ENTRY CANCELLED:", entry_price)
 
 
 def update_result(row_number, judge_price, result):
@@ -142,9 +128,45 @@ def judge_result(signal, entry_price, judge_price):
     return "UNKNOWN"
 
 
-def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number):
+def should_cancel_entry(signal, signal_price, entry_price):
+    if signal_price is None:
+        return False
+
+    try:
+        signal_price = float(signal_price)
+    except Exception:
+        return False
+
+    if signal == "HIGH" and entry_price <= signal_price:
+        return True
+
+    if signal == "LOW" and entry_price >= signal_price:
+        return True
+
+    return False
+
+
+def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number, signal_price):
     try:
         entry_price = get_usdjpy_price()
+
+        if should_cancel_entry(signal, signal_price, entry_price):
+            update_cancel(row_number, entry_price)
+
+            cancel_message = (
+                f"⚫【エントリー中止】\n\n"
+                f"今回は見送り\n\n"
+                f"通貨: {pair}\n"
+                f"足種: {timeframe}\n"
+                f"方向: {signal}\n\n"
+                f"シグナル時価格: {signal_price}\n"
+                f"2分後価格: {entry_price}\n\n"
+                f"理由: 方向が崩れたため"
+            )
+
+            send_line_message(cancel_message)
+            return
+
         update_entry_price(row_number, entry_price)
 
         message = (
@@ -163,13 +185,12 @@ def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number):
             judge_and_update_sheet,
             args=[signal, pair, timeframe, row_number, entry_price]
         )
-
         timer.daemon = True
         timer.start()
 
     except Exception as e:
         print("ENTRY ERROR:", str(e))
-        send_line_message(f"⚠️ エントリー価格取得エラー\n{str(e)}")
+        send_line_message(f"⚠️ エントリー処理エラー\n{str(e)}")
 
 
 def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
@@ -193,7 +214,7 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
 
     except Exception as e:
         print("JUDGE ERROR:", str(e))
-        send_line_message(f"⚠️ 判定価格取得エラー\n{str(e)}")
+        send_line_message(f"⚠️ 判定処理エラー\n{str(e)}")
 
 
 def process_signal(data):
@@ -203,6 +224,7 @@ def process_signal(data):
         signal = data.get("signal", "UNKNOWN")
         pair = data.get("pair", "USDJPY")
         timeframe = data.get("timeframe", "5")
+        signal_price = data.get("signal_price")
 
         now = datetime.now(JST)
         entry_dt = now + timedelta(minutes=2)
@@ -216,7 +238,8 @@ def process_signal(data):
             f"まだエントリーしない\n\n"
             f"通貨: {pair}\n"
             f"足種: {timeframe}\n"
-            f"方向: {signal}\n\n"
+            f"方向: {signal}\n"
+            f"シグナル時価格: {signal_price}\n\n"
             f"エントリー予定時刻: {entry_time}\n"
             f"判定予定時刻: {judge_time}"
         )
@@ -234,9 +257,8 @@ def process_signal(data):
         timer = threading.Timer(
             120,
             send_entry_and_schedule_judgement,
-            args=[signal, pair, timeframe, row_number]
+            args=[signal, pair, timeframe, row_number, signal_price]
         )
-
         timer.daemon = True
         timer.start()
 
@@ -261,7 +283,6 @@ def webhook():
             target=process_signal,
             args=[data]
         )
-
         worker.daemon = True
         worker.start()
 
