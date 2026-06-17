@@ -4,6 +4,8 @@ import os
 import threading
 import json
 import gspread
+from collections import defaultdict
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -17,6 +19,18 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 JST = ZoneInfo("Asia/Tokyo")
 SYMBOL = "USD/JPY"
+HISTORY_SHEET_NAME = "履歴"
+SUMMARY_SHEET_NAME = "日別集計"
+SUMMARY_HEADERS = [
+    "日付",
+    "総シグナル数",
+    "エントリー数",
+    "WIN",
+    "LOSE",
+    "DRAW",
+    "CANCEL",
+    "勝率"
+]
 
 
 def send_line_message(message):
@@ -47,7 +61,7 @@ def get_usdjpy_price():
     return float(data["price"])
 
 
-def get_sheet():
+def get_spreadsheet():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -61,7 +75,157 @@ def get_sheet():
     )
 
     client = gspread.authorize(credentials)
-    return client.open_by_key(SPREADSHEET_ID).sheet1
+    return client.open_by_key(SPREADSHEET_ID)
+
+
+def get_sheet():
+    spreadsheet = get_spreadsheet()
+
+    try:
+        return spreadsheet.worksheet(HISTORY_SHEET_NAME)
+    except WorksheetNotFound:
+        return spreadsheet.sheet1
+
+
+def update_values(worksheet, range_name, values):
+    try:
+        worksheet.update(
+            range_name=range_name,
+            values=values,
+            value_input_option="USER_ENTERED"
+        )
+    except TypeError:
+        worksheet.update(
+            range_name,
+            values,
+            value_input_option="USER_ENTERED"
+        )
+
+
+def extract_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    for fmt in (
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d",
+        "%Y-%m-%d",
+        "%Y年%m月%d日 %H:%M:%S",
+        "%Y年%m月%d日 %H:%M",
+        "%Y年%m月%d日"
+    ):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y/%m/%d")
+        except ValueError:
+            pass
+
+    head = text.split()[0].replace("-", "/").replace(".", "/")
+    if len(head) >= 10:
+        return head[:10]
+    return None
+
+
+def normalize_result(value):
+    return str(value or "").strip().upper()
+
+
+def get_or_create_summary_sheet():
+    spreadsheet = get_spreadsheet()
+
+    try:
+        sheet = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
+    except WorksheetNotFound:
+        sheet = spreadsheet.add_worksheet(
+            title=SUMMARY_SHEET_NAME,
+            rows=1000,
+            cols=len(SUMMARY_HEADERS)
+        )
+
+    update_values(sheet, "A1:H1", [SUMMARY_HEADERS])
+
+    try:
+        sheet.format("H2:H", {
+            "numberFormat": {
+                "type": "PERCENT",
+                "pattern": "0.0%"
+            }
+        })
+    except Exception as e:
+        print("SUMMARY FORMAT SKIPPED:", str(e))
+
+    return sheet
+
+
+def update_daily_summary():
+    history_sheet = get_sheet()
+    summary_sheet = get_or_create_summary_sheet()
+    rows = history_sheet.get_all_values()
+
+    daily = defaultdict(lambda: {
+        "total": 0,
+        "WIN": 0,
+        "LOSE": 0,
+        "DRAW": 0,
+        "CANCEL": 0
+    })
+
+    for row in rows[1:]:
+        if not row:
+            continue
+
+        date_key = extract_date(row[0] if len(row) > 0 else "")
+        if not date_key:
+            continue
+
+        result = normalize_result(row[8] if len(row) > 8 else "")
+        daily[date_key]["total"] += 1
+
+        if result in ("WIN", "LOSE", "DRAW", "CANCEL"):
+            daily[date_key][result] += 1
+
+    values = [SUMMARY_HEADERS]
+
+    for date_key in sorted(daily.keys()):
+        counts = daily[date_key]
+        entry_count = counts["WIN"] + counts["LOSE"] + counts["DRAW"]
+        win_rate = counts["WIN"] / entry_count if entry_count else 0
+
+        values.append([
+            date_key,
+            counts["total"],
+            entry_count,
+            counts["WIN"],
+            counts["LOSE"],
+            counts["DRAW"],
+            counts["CANCEL"],
+            win_rate
+        ])
+
+    summary_sheet.clear()
+    update_values(summary_sheet, f"A1:H{len(values)}", values)
+
+    try:
+        summary_sheet.format("H2:H", {
+            "numberFormat": {
+                "type": "PERCENT",
+                "pattern": "0.0%"
+            }
+        })
+    except Exception as e:
+        print("SUMMARY FORMAT SKIPPED:", str(e))
+
+    print("DAILY SUMMARY UPDATED")
+
+
+def safe_update_daily_summary():
+    try:
+        update_daily_summary()
+    except Exception as e:
+        print("DAILY SUMMARY ERROR:", str(e))
 
 
 def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
@@ -98,6 +262,7 @@ def update_cancel(row_number, entry_price):
     sheet = get_sheet()
     sheet.update_cell(row_number, 6, entry_price)
     sheet.update_cell(row_number, 9, "CANCEL")
+    safe_update_daily_summary()
     print("ENTRY CANCELLED:", entry_price)
 
 
@@ -199,6 +364,7 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
         result = judge_result(signal, entry_price, judge_price)
 
         update_result(row_number, judge_price, result)
+        safe_update_daily_summary()
 
         message = (
             f"📊【判定結果】\n\n"
