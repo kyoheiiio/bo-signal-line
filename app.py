@@ -27,9 +27,21 @@ def send_line_message(message):
         "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
     }
 
-    payload = {"messages": [{"type": "text", "text": message}]}
+    payload = {
+        "messages": [
+            {
+                "type": "text",
+                "text": message
+            }
+        ]
+    }
 
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=10
+    )
 
     print("LINE STATUS:", response.status_code)
     print("LINE RESPONSE:", response.text)
@@ -43,7 +55,7 @@ def get_usdjpy_price():
         "apikey": TWELVE_DATA_API_KEY
     }
 
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=params, timeout=10)
     data = response.json()
 
     print("PRICE RESPONSE:", data)
@@ -99,18 +111,14 @@ def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
 
 def update_entry_price(row_number, entry_price):
     sheet = get_sheet()
-
     sheet.update_cell(row_number, 6, entry_price)
-
     print("ENTRY PRICE UPDATED:", entry_price)
 
 
 def update_result(row_number, judge_price, result):
     sheet = get_sheet()
-
     sheet.update_cell(row_number, 8, judge_price)
     sheet.update_cell(row_number, 9, result)
-
     print("RESULT UPDATED:", judge_price, result)
 
 
@@ -188,17 +196,9 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
         send_line_message(f"⚠️ 判定価格取得エラー\n{str(e)}")
 
 
-@app.route("/")
-def home():
-    return "BO Signal Bot Running"
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
+def process_signal(data):
     try:
-        data = request.get_json(force=True)
-
-        print("RECEIVED:", data)
+        print("PROCESS START:", data)
 
         signal = data.get("signal", "UNKNOWN")
         pair = data.get("pair", "USDJPY")
@@ -240,13 +240,38 @@ def webhook():
         timer.daemon = True
         timer.start()
 
+    except Exception as e:
+        print("PROCESS ERROR:", str(e))
+        send_line_message(f"⚠️ シグナル処理エラー\n{str(e)}")
+
+
+@app.route("/")
+def home():
+    return "BO Signal Bot Running"
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        data = request.get_json(force=True)
+
+        print("RECEIVED:", data)
+
+        worker = threading.Thread(
+            target=process_signal,
+            args=[data]
+        )
+
+        worker.daemon = True
+        worker.start()
+
         return {
-            "status": "success",
-            "message": "LINE通知、価格取得予約、スプレッドシート記録完了"
+            "status": "accepted",
+            "message": "Webhook受信。バックグラウンド処理開始。"
         }, 200
 
     except Exception as e:
-        print("ERROR:", str(e))
+        print("WEBHOOK ERROR:", str(e))
 
         return {
             "status": "error",
@@ -256,5 +281,4 @@ def webhook():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-
     app.run(host="0.0.0.0", port=port)
