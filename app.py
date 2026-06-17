@@ -18,9 +18,26 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 JST = ZoneInfo("Asia/Tokyo")
+
+ENTRY_DELAY_SECONDS = 120
+JUDGE_DELAY_SECONDS = 300
 SYMBOL = "USD/JPY"
 HISTORY_SHEET_NAME = "履歴"
 SUMMARY_SHEET_NAME = "日別集計"
+DUPLICATE_WINDOW_SECONDS = 120
+
+HISTORY_HEADERS = [
+    "日時",
+    "通貨",
+    "足種",
+    "方向",
+    "エントリー時刻",
+    "エントリー価格",
+    "判定時刻",
+    "判定終了価格",
+    "結果"
+]
+
 SUMMARY_HEADERS = [
     "日付",
     "総シグナル数",
@@ -32,74 +49,175 @@ SUMMARY_HEADERS = [
     "勝率"
 ]
 
+recent_signal_keys = {}
+recent_signal_lock = threading.Lock()
+
+
+def log(message, *values):
+    if values:
+        print(message, *values, flush=True)
+    else:
+        print(message, flush=True)
+
+
+def log_error(stage, error):
+    log(f"ERROR [{stage}]: {type(error).__name__}: {error}")
+
 
 def send_line_message(message):
-    url = "https://api.line.me/v2/bot/message/broadcast"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
-    }
-    payload = {"messages": [{"type": "text", "text": message}]}
-    response = requests.post(url, headers=headers, json=payload, timeout=10)
-    print("LINE STATUS:", response.status_code)
-    print("LINE RESPONSE:", response.text)
+    try:
+        if not LINE_ACCESS_TOKEN:
+            raise RuntimeError("LINE_ACCESS_TOKEN is not set")
+
+        url = "https://api.line.me/v2/bot/message/broadcast"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
+        }
+        payload = {"messages": [{"type": "text", "text": message}]}
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+
+        log("LINE STATUS:", response.status_code)
+        log("LINE RESPONSE:", response.text)
+
+        if response.status_code >= 400:
+            raise RuntimeError(f"LINE API error {response.status_code}: {response.text}")
+
+        return True
+
+    except Exception as e:
+        log_error("LINE SEND", e)
+        return False
+
+
+def notify_error(title, error):
+    message = f"⚠️ {title}\n{type(error).__name__}: {error}"
+    send_line_message(message)
 
 
 def get_usdjpy_price():
-    url = "https://api.twelvedata.com/price"
-    params = {
-        "symbol": SYMBOL,
-        "apikey": TWELVE_DATA_API_KEY
-    }
-    response = requests.get(url, params=params, timeout=10)
-    data = response.json()
-    print("PRICE RESPONSE:", data)
+    try:
+        if not TWELVE_DATA_API_KEY:
+            raise RuntimeError("TWELVE_DATA_API_KEY is not set")
 
-    if "price" not in data:
-        raise Exception(f"価格取得失敗: {data}")
+        url = "https://api.twelvedata.com/price"
+        params = {
+            "symbol": SYMBOL,
+            "apikey": TWELVE_DATA_API_KEY
+        }
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
 
-    return float(data["price"])
+        data = response.json()
+        log("PRICE RESPONSE:", data)
+
+        if "price" not in data:
+            raise RuntimeError(f"価格取得失敗: {data}")
+
+        price = float(data["price"])
+        return price
+
+    except Exception as e:
+        log_error("TWELVE DATA PRICE", e)
+        raise
 
 
 def get_spreadsheet():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-
-    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-
-    credentials = Credentials.from_service_account_info(
-        service_account_info,
-        scopes=scopes
-    )
-
-    client = gspread.authorize(credentials)
-    return client.open_by_key(SPREADSHEET_ID)
-
-
-def get_sheet():
-    spreadsheet = get_spreadsheet()
-
     try:
-        return spreadsheet.worksheet(HISTORY_SHEET_NAME)
-    except WorksheetNotFound:
-        return spreadsheet.sheet1
+        if not SPREADSHEET_ID:
+            raise RuntimeError("SPREADSHEET_ID is not set")
+        if not GOOGLE_SERVICE_ACCOUNT_JSON:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        credentials = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=scopes
+        )
+        client = gspread.authorize(credentials)
+        return client.open_by_key(SPREADSHEET_ID)
+
+    except Exception as e:
+        log_error("GOOGLE SHEETS AUTH", e)
+        raise
 
 
 def update_values(worksheet, range_name, values):
     try:
-        worksheet.update(
-            range_name=range_name,
-            values=values,
-            value_input_option="USER_ENTERED"
-        )
-    except TypeError:
-        worksheet.update(
-            range_name,
-            values,
-            value_input_option="USER_ENTERED"
-        )
+        try:
+            worksheet.update(
+                range_name=range_name,
+                values=values,
+                value_input_option="USER_ENTERED"
+            )
+        except TypeError:
+            worksheet.update(
+                range_name,
+                values,
+                value_input_option="USER_ENTERED"
+            )
+    except Exception as e:
+        log_error("GOOGLE SHEETS UPDATE VALUES", e)
+        raise
+
+
+def get_or_create_worksheet(sheet_name, headers):
+    try:
+        spreadsheet = get_spreadsheet()
+
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except WorksheetNotFound:
+            worksheet = None
+
+            if sheet_name == HISTORY_SHEET_NAME:
+                worksheets = spreadsheet.worksheets()
+                if worksheets and worksheets[0].title != SUMMARY_SHEET_NAME:
+                    worksheet = worksheets[0]
+                    if worksheet.title != HISTORY_SHEET_NAME:
+                        worksheet.update_title(HISTORY_SHEET_NAME)
+
+            if worksheet is None:
+                worksheet = spreadsheet.add_worksheet(
+                    title=sheet_name,
+                    rows=1000,
+                    cols=len(headers)
+                )
+
+        ensure_headers(worksheet, headers)
+
+        return worksheet
+
+    except Exception as e:
+        log_error(f"GET OR CREATE WORKSHEET {sheet_name}", e)
+        raise
+
+
+def ensure_headers(worksheet, headers):
+    try:
+        first_row = worksheet.row_values(1)
+        if first_row[:len(headers)] == headers:
+            return
+
+        first_row_has_value = any(str(value).strip() for value in first_row)
+        first_row_looks_like_header = any(value in headers for value in first_row)
+
+        if first_row_has_value and not first_row_looks_like_header:
+            worksheet.insert_row(headers, index=1, value_input_option="USER_ENTERED")
+        else:
+            update_values(worksheet, f"A1:{chr(64 + len(headers))}1", [headers])
+
+    except Exception as e:
+        log_error("ENSURE HEADERS", e)
+        raise
+
+
+def get_history_sheet():
+    return get_or_create_worksheet(HISTORY_SHEET_NAME, HISTORY_HEADERS)
 
 
 def extract_date(value):
@@ -133,162 +251,156 @@ def normalize_result(value):
     return str(value or "").strip().upper()
 
 
-def get_or_create_summary_sheet():
-    spreadsheet = get_spreadsheet()
-
-    try:
-        sheet = spreadsheet.worksheet(SUMMARY_SHEET_NAME)
-    except WorksheetNotFound:
-        sheet = spreadsheet.add_worksheet(
-            title=SUMMARY_SHEET_NAME,
-            rows=1000,
-            cols=len(SUMMARY_HEADERS)
-        )
-
-    update_values(sheet, "A1:H1", [SUMMARY_HEADERS])
-
-    try:
-        sheet.format("H2:H", {
-            "numberFormat": {
-                "type": "PERCENT",
-                "pattern": "0.0%"
-            }
-        })
-    except Exception as e:
-        print("SUMMARY FORMAT SKIPPED:", str(e))
-
-    return sheet
-
-
 def update_daily_summary():
-    history_sheet = get_sheet()
-    summary_sheet = get_or_create_summary_sheet()
-    rows = history_sheet.get_all_values()
-
-    daily = defaultdict(lambda: {
-        "total": 0,
-        "WIN": 0,
-        "LOSE": 0,
-        "DRAW": 0,
-        "CANCEL": 0
-    })
-
-    for row in rows[1:]:
-        if not row:
-            continue
-
-        date_key = extract_date(row[0] if len(row) > 0 else "")
-        if not date_key:
-            continue
-
-        result = normalize_result(row[8] if len(row) > 8 else "")
-        daily[date_key]["total"] += 1
-
-        if result in ("WIN", "LOSE", "DRAW", "CANCEL"):
-            daily[date_key][result] += 1
-
-    values = [SUMMARY_HEADERS]
-
-    for date_key in sorted(daily.keys()):
-        counts = daily[date_key]
-        entry_count = counts["WIN"] + counts["LOSE"] + counts["DRAW"]
-        win_rate = counts["WIN"] / entry_count if entry_count else 0
-
-        values.append([
-            date_key,
-            counts["total"],
-            entry_count,
-            counts["WIN"],
-            counts["LOSE"],
-            counts["DRAW"],
-            counts["CANCEL"],
-            win_rate
-        ])
-
-    summary_sheet.clear()
-    update_values(summary_sheet, f"A1:H{len(values)}", values)
-
     try:
-        summary_sheet.format("H2:H", {
-            "numberFormat": {
-                "type": "PERCENT",
-                "pattern": "0.0%"
-            }
-        })
-    except Exception as e:
-        print("SUMMARY FORMAT SKIPPED:", str(e))
+        history_sheet = get_history_sheet()
+        summary_sheet = get_or_create_worksheet(SUMMARY_SHEET_NAME, SUMMARY_HEADERS)
+        rows = history_sheet.get_all_values()
 
-    print("DAILY SUMMARY UPDATED")
+        daily = defaultdict(lambda: {
+            "total": 0,
+            "WIN": 0,
+            "LOSE": 0,
+            "DRAW": 0,
+            "CANCEL": 0
+        })
+
+        for row in rows[1:]:
+            if not row:
+                continue
+
+            date_key = extract_date(row[0] if len(row) > 0 else "")
+            if not date_key:
+                continue
+
+            result = normalize_result(row[8] if len(row) > 8 else "")
+            daily[date_key]["total"] += 1
+
+            if result in ("WIN", "LOSE", "DRAW", "CANCEL"):
+                daily[date_key][result] += 1
+
+        values = [SUMMARY_HEADERS]
+        for date_key in sorted(daily.keys()):
+            counts = daily[date_key]
+            entry_count = counts["WIN"] + counts["LOSE"] + counts["DRAW"]
+            win_rate = counts["WIN"] / entry_count if entry_count else 0
+
+            values.append([
+                date_key,
+                counts["total"],
+                entry_count,
+                counts["WIN"],
+                counts["LOSE"],
+                counts["DRAW"],
+                counts["CANCEL"],
+                win_rate
+            ])
+
+        summary_sheet.clear()
+        update_values(summary_sheet, f"A1:H{len(values)}", values)
+
+        try:
+            summary_sheet.format("H2:H", {
+                "numberFormat": {
+                    "type": "PERCENT",
+                    "pattern": "0.0%"
+                }
+            })
+        except Exception as e:
+            log_error("DAILY SUMMARY FORMAT", e)
+
+        log("DAILY SUMMARY UPDATED")
+
+    except Exception as e:
+        log_error("DAILY SUMMARY UPDATE", e)
+        raise
 
 
 def safe_update_daily_summary():
     try:
         update_daily_summary()
-    except Exception as e:
-        print("DAILY SUMMARY ERROR:", str(e))
+    except Exception:
+        pass
 
 
 def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
-    sheet = get_sheet()
-    now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+    try:
+        sheet = get_history_sheet()
+        now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
-    row = [
-        now,
-        pair,
-        timeframe,
-        signal,
-        entry_time,
-        "",
-        judge_time,
-        "",
-        "判定待ち"
-    ]
+        row = [
+            now,
+            pair,
+            timeframe,
+            signal,
+            entry_time,
+            "",
+            judge_time,
+            "",
+            "判定待ち"
+        ]
 
-    sheet.append_row(row, value_input_option="USER_ENTERED")
-    row_number = len(sheet.get_all_values())
+        sheet.append_row(row, value_input_option="USER_ENTERED")
+        row_number = len(sheet.get_all_values())
 
-    print("SHEET APPENDED ROW:", row_number)
+        log("SHEET APPENDED ROW:", row_number)
+        safe_update_daily_summary()
 
-    return row_number
+        return row_number
+
+    except Exception as e:
+        log_error("SHEET APPEND PENDING ROW", e)
+        raise
 
 
 def update_entry_price(row_number, entry_price):
-    sheet = get_sheet()
-    sheet.update_cell(row_number, 6, entry_price)
-    print("ENTRY PRICE UPDATED:", entry_price)
+    try:
+        sheet = get_history_sheet()
+        sheet.update_cell(row_number, 6, entry_price)
+        log("ENTRY PRICE:", entry_price)
+    except Exception as e:
+        log_error("SHEET UPDATE ENTRY PRICE", e)
+        raise
 
 
 def update_cancel(row_number, entry_price):
-    sheet = get_sheet()
-    sheet.update_cell(row_number, 6, entry_price)
-    sheet.update_cell(row_number, 9, "CANCEL")
-    safe_update_daily_summary()
-    print("ENTRY CANCELLED:", entry_price)
+    try:
+        sheet = get_history_sheet()
+        sheet.update_cell(row_number, 6, entry_price)
+        sheet.update_cell(row_number, 9, "CANCEL")
+        log("ENTRY CANCELLED:", entry_price)
+        safe_update_daily_summary()
+    except Exception as e:
+        log_error("SHEET UPDATE CANCEL", e)
+        raise
 
 
 def update_result(row_number, judge_price, result):
-    sheet = get_sheet()
-    sheet.update_cell(row_number, 8, judge_price)
-    sheet.update_cell(row_number, 9, result)
-    print("RESULT UPDATED:", judge_price, result)
+    try:
+        sheet = get_history_sheet()
+        sheet.update_cell(row_number, 8, judge_price)
+        sheet.update_cell(row_number, 9, result)
+        log("RESULT UPDATED:", judge_price, result)
+        safe_update_daily_summary()
+    except Exception as e:
+        log_error("SHEET UPDATE RESULT", e)
+        raise
 
 
 def judge_result(signal, entry_price, judge_price):
     if signal == "HIGH":
         if judge_price > entry_price:
             return "WIN"
-        elif judge_price < entry_price:
+        if judge_price < entry_price:
             return "LOSE"
-        else:
-            return "DRAW"
+        return "DRAW"
 
     if signal == "LOW":
         if judge_price < entry_price:
             return "WIN"
-        elif judge_price > entry_price:
+        if judge_price > entry_price:
             return "LOSE"
-        else:
-            return "DRAW"
+        return "DRAW"
 
     return "UNKNOWN"
 
@@ -298,14 +410,14 @@ def should_cancel_entry(signal, signal_price, entry_price):
         return False
 
     try:
-        signal_price = float(signal_price)
+        signal_price_float = float(signal_price)
     except Exception:
         return False
 
-    if signal == "HIGH" and entry_price <= signal_price:
+    if signal == "HIGH" and entry_price <= signal_price_float:
         return True
 
-    if signal == "LOW" and entry_price >= signal_price:
+    if signal == "LOW" and entry_price >= signal_price_float:
         return True
 
     return False
@@ -314,6 +426,7 @@ def should_cancel_entry(signal, signal_price, entry_price):
 def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number, signal_price):
     try:
         entry_price = get_usdjpy_price()
+        log("ENTRY PRICE:", entry_price)
 
         if should_cancel_entry(signal, signal_price, entry_price):
             update_cancel(row_number, entry_price)
@@ -329,7 +442,8 @@ def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number, signa
                 f"理由: 方向が崩れたため"
             )
 
-            send_line_message(cancel_message)
+            if send_line_message(cancel_message):
+                log("ENTRY CANCEL NOTICE SENT")
             return
 
         update_entry_price(row_number, entry_price)
@@ -343,10 +457,11 @@ def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number, signa
             f"エントリー価格: {entry_price}"
         )
 
-        send_line_message(message)
+        if send_line_message(message):
+            log("ENTRY NOTICE SENT")
 
         timer = threading.Timer(
-            300,
+            JUDGE_DELAY_SECONDS,
             judge_and_update_sheet,
             args=[signal, pair, timeframe, row_number, entry_price]
         )
@@ -354,17 +469,17 @@ def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number, signa
         timer.start()
 
     except Exception as e:
-        print("ENTRY ERROR:", str(e))
-        send_line_message(f"⚠️ エントリー処理エラー\n{str(e)}")
+        log_error("ENTRY PROCESS", e)
+        notify_error("エントリー処理エラー", e)
 
 
 def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
     try:
         judge_price = get_usdjpy_price()
-        result = judge_result(signal, entry_price, judge_price)
+        log("JUDGE PRICE:", judge_price)
 
+        result = judge_result(signal, entry_price, judge_price)
         update_result(row_number, judge_price, result)
-        safe_update_daily_summary()
 
         message = (
             f"📊【判定結果】\n\n"
@@ -376,25 +491,26 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
             f"結果: {result}"
         )
 
-        send_line_message(message)
+        if send_line_message(message):
+            log("JUDGE NOTICE SENT")
 
     except Exception as e:
-        print("JUDGE ERROR:", str(e))
-        send_line_message(f"⚠️ 判定処理エラー\n{str(e)}")
+        log_error("JUDGE PROCESS", e)
+        notify_error("判定処理エラー", e)
 
 
 def process_signal(data):
     try:
-        print("PROCESS START:", data)
+        log("PROCESS START:", data)
 
-        signal = data.get("signal", "UNKNOWN")
-        pair = data.get("pair", "USDJPY")
-        timeframe = data.get("timeframe", "5")
+        signal = str(data.get("signal", "UNKNOWN")).strip().upper()
+        pair = str(data.get("pair", "USDJPY")).strip()
+        timeframe = str(data.get("timeframe", "5")).strip()
         signal_price = data.get("signal_price")
 
         now = datetime.now(JST)
-        entry_dt = now + timedelta(minutes=2)
-        judge_dt = entry_dt + timedelta(minutes=5)
+        entry_dt = now + timedelta(seconds=ENTRY_DELAY_SECONDS)
+        judge_dt = entry_dt + timedelta(seconds=JUDGE_DELAY_SECONDS)
 
         entry_time = entry_dt.strftime("%Y/%m/%d %H:%M:%S")
         judge_time = judge_dt.strftime("%Y/%m/%d %H:%M:%S")
@@ -410,7 +526,8 @@ def process_signal(data):
             f"判定予定時刻: {judge_time}"
         )
 
-        send_line_message(pre_message)
+        if send_line_message(pre_message):
+            log("PRE NOTICE SENT")
 
         row_number = append_pending_row(
             pair=pair,
@@ -421,7 +538,7 @@ def process_signal(data):
         )
 
         timer = threading.Timer(
-            120,
+            ENTRY_DELAY_SECONDS,
             send_entry_and_schedule_judgement,
             args=[signal, pair, timeframe, row_number, signal_price]
         )
@@ -429,8 +546,39 @@ def process_signal(data):
         timer.start()
 
     except Exception as e:
-        print("PROCESS ERROR:", str(e))
-        send_line_message(f"⚠️ シグナル処理エラー\n{str(e)}")
+        log_error("SIGNAL PROCESS", e)
+        notify_error("シグナル処理エラー", e)
+
+
+def build_duplicate_key(data, received_at):
+    received_minute = received_at.strftime("%Y/%m/%d %H:%M")
+    return (
+        str(data.get("signal", "")).strip().upper(),
+        str(data.get("pair", "")).strip(),
+        str(data.get("timeframe", "")).strip(),
+        str(data.get("signal_price", "")).strip(),
+        received_minute
+    )
+
+
+def is_duplicate_signal(data, received_at):
+    key = build_duplicate_key(data, received_at)
+    now_ts = received_at.timestamp()
+
+    with recent_signal_lock:
+        expired_keys = [
+            saved_key
+            for saved_key, saved_ts in recent_signal_keys.items()
+            if now_ts - saved_ts > DUPLICATE_WINDOW_SECONDS
+        ]
+        for expired_key in expired_keys:
+            recent_signal_keys.pop(expired_key, None)
+
+        if key in recent_signal_keys and now_ts - recent_signal_keys[key] <= DUPLICATE_WINDOW_SECONDS:
+            return True
+
+        recent_signal_keys[key] = now_ts
+        return False
 
 
 @app.route("/")
@@ -442,8 +590,16 @@ def home():
 def webhook():
     try:
         data = request.get_json(force=True)
+        received_at = datetime.now(JST)
 
-        print("RECEIVED:", data)
+        log("RECEIVED:", data)
+
+        if is_duplicate_signal(data, received_at):
+            log("DUPLICATE SIGNAL SKIPPED:", data)
+            return {
+                "status": "accepted",
+                "message": "Duplicate signal skipped."
+            }, 200
 
         worker = threading.Thread(
             target=process_signal,
@@ -458,8 +614,7 @@ def webhook():
         }, 200
 
     except Exception as e:
-        print("WEBHOOK ERROR:", str(e))
-
+        log_error("WEBHOOK", e)
         return {
             "status": "error",
             "message": str(e)
