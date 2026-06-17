@@ -2,10 +2,19 @@ from flask import Flask, request
 import requests
 import os
 import threading
+import json
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+JST = ZoneInfo("Asia/Tokyo")
 
 
 def send_line_message(message):
@@ -29,6 +38,45 @@ def send_line_message(message):
 
     print("LINE STATUS:", response.status_code)
     print("LINE RESPONSE:", response.text)
+
+
+def get_sheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+    credentials = Credentials.from_service_account_info(
+        service_account_info,
+        scopes=scopes
+    )
+
+    client = gspread.authorize(credentials)
+    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+
+    return sheet
+
+
+def append_signal_to_sheet(pair, timeframe, signal, entry_time, judge_time):
+    sheet = get_sheet()
+
+    now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+
+    row = [
+        now,
+        pair,
+        timeframe,
+        signal,
+        entry_time,
+        judge_time,
+        "判定待ち"
+    ]
+
+    sheet.append_row(row, value_input_option="USER_ENTERED")
+
+    print("SHEET APPENDED:", row)
 
 
 def send_entry_message(signal, pair, timeframe):
@@ -59,16 +107,32 @@ def webhook():
         pair = data.get("pair", "UNKNOWN")
         timeframe = data.get("timeframe", "UNKNOWN")
 
+        now = datetime.now(JST)
+        entry_dt = now + timedelta(minutes=2)
+        judge_dt = entry_dt + timedelta(minutes=5)
+
+        entry_time = entry_dt.strftime("%Y/%m/%d %H:%M:%S")
+        judge_time = judge_dt.strftime("%Y/%m/%d %H:%M:%S")
+
         pre_message = (
             f"🟡【事前通知｜2分前】\n\n"
             f"まだエントリーしない\n\n"
             f"通貨: {pair}\n"
             f"足種: {timeframe}\n"
             f"方向: {signal}\n\n"
-            f"2分後にエントリー予定"
+            f"エントリー予定時刻: {entry_time}\n"
+            f"判定予定時刻: {judge_time}"
         )
 
         send_line_message(pre_message)
+
+        append_signal_to_sheet(
+            pair=pair,
+            timeframe=timeframe,
+            signal=signal,
+            entry_time=entry_time,
+            judge_time=judge_time
+        )
 
         timer = threading.Timer(
             120,
@@ -81,7 +145,7 @@ def webhook():
 
         return {
             "status": "success",
-            "message": "2分前通知送信、エントリー通知予約完了"
+            "message": "LINE通知とスプレッドシート記録完了"
         }, 200
 
     except Exception as e:
