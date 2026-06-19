@@ -19,7 +19,6 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 JST = ZoneInfo("Asia/Tokyo")
 
-ENTRY_DELAY_SECONDS = 120
 JUDGE_DELAY_SECONDS = 300
 SYMBOL = "USD/JPY"
 HISTORY_SHEET_NAME = "履歴"
@@ -323,7 +322,7 @@ def safe_update_daily_summary():
         pass
 
 
-def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
+def append_entry_row(pair, timeframe, signal, entry_time, entry_price, judge_time):
     try:
         sheet = get_history_sheet()
         now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
@@ -334,10 +333,10 @@ def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
             timeframe,
             signal,
             entry_time,
-            "",
+            entry_price,
             judge_time,
             "",
-            "判定待ち"
+            ""
         ]
 
         sheet.append_row(row, value_input_option="USER_ENTERED")
@@ -349,30 +348,12 @@ def append_pending_row(pair, timeframe, signal, entry_time, judge_time):
         return row_number
 
     except Exception as e:
-        log_error("SHEET APPEND PENDING ROW", e)
+        log_error("SHEET APPEND ENTRY ROW", e)
         raise
 
 
-def update_entry_price(row_number, entry_price):
-    try:
-        sheet = get_history_sheet()
-        sheet.update_cell(row_number, 6, entry_price)
-        log("ENTRY PRICE:", entry_price)
-    except Exception as e:
-        log_error("SHEET UPDATE ENTRY PRICE", e)
-        raise
-
-
-def update_cancel(row_number, entry_price):
-    try:
-        sheet = get_history_sheet()
-        sheet.update_cell(row_number, 6, entry_price)
-        sheet.update_cell(row_number, 9, "CANCEL")
-        log("ENTRY CANCELLED:", entry_price)
-        safe_update_daily_summary()
-    except Exception as e:
-        log_error("SHEET UPDATE CANCEL", e)
-        raise
+def format_price(price):
+    return f"{float(price):.3f}"
 
 
 def update_result(row_number, judge_price, result):
@@ -405,89 +386,22 @@ def judge_result(signal, entry_price, judge_price):
     return "UNKNOWN"
 
 
-def should_cancel_entry(signal, signal_price, entry_price):
-    if signal_price is None:
-        return False
-
-    try:
-        signal_price_float = float(signal_price)
-    except Exception:
-        return False
-
-    if signal == "HIGH" and entry_price <= signal_price_float:
-        return True
-
-    if signal == "LOW" and entry_price >= signal_price_float:
-        return True
-
-    return False
-
-
-def send_entry_and_schedule_judgement(signal, pair, timeframe, row_number, signal_price):
-    try:
-        entry_price = get_usdjpy_price()
-        log("ENTRY PRICE:", entry_price)
-
-        if should_cancel_entry(signal, signal_price, entry_price):
-            update_cancel(row_number, entry_price)
-
-            cancel_message = (
-                f"⚫【エントリー中止】\n\n"
-                f"今回は見送り\n\n"
-                f"通貨: {pair}\n"
-                f"足種: {timeframe}\n"
-                f"方向: {signal}\n\n"
-                f"シグナル時価格: {signal_price}\n"
-                f"2分後価格: {entry_price}\n\n"
-                f"理由: 方向が崩れたため"
-            )
-
-            if send_line_message(cancel_message):
-                log("ENTRY CANCEL NOTICE SENT")
-            return
-
-        update_entry_price(row_number, entry_price)
-
-        message = (
-            f"🔴【本番エントリー通知】\n\n"
-            f"今すぐエントリー\n\n"
-            f"通貨: {pair}\n"
-            f"足種: {timeframe}\n"
-            f"方向: {signal}\n"
-            f"エントリー価格: {entry_price}"
-        )
-
-        if send_line_message(message):
-            log("ENTRY NOTICE SENT")
-
-        timer = threading.Timer(
-            JUDGE_DELAY_SECONDS,
-            judge_and_update_sheet,
-            args=[signal, pair, timeframe, row_number, entry_price]
-        )
-        timer.daemon = True
-        timer.start()
-
-    except Exception as e:
-        log_error("ENTRY PROCESS", e)
-        notify_error("エントリー処理エラー", e)
-
-
 def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
     try:
         judge_price = get_usdjpy_price()
+        judge_price_text = format_price(judge_price)
         log("JUDGE PRICE:", judge_price)
 
         result = judge_result(signal, entry_price, judge_price)
-        update_result(row_number, judge_price, result)
+        update_result(row_number, judge_price_text, result)
 
         message = (
             f"📊【判定結果】\n\n"
             f"通貨: {pair}\n"
             f"足種: {timeframe}\n"
             f"方向: {signal}\n\n"
-            f"エントリー価格: {entry_price}\n"
-            f"判定終了価格: {judge_price}\n"
+            f"エントリー価格: {format_price(entry_price)}\n"
+            f"判定終了価格: {judge_price_text}\n"
             f"結果: {result}"
         )
 
@@ -506,41 +420,43 @@ def process_signal(data):
         signal = str(data.get("signal", "UNKNOWN")).strip().upper()
         pair = str(data.get("pair", "USDJPY")).strip()
         timeframe = str(data.get("timeframe", "5")).strip()
-        signal_price = data.get("signal_price")
 
         now = datetime.now(JST)
-        entry_dt = now + timedelta(seconds=ENTRY_DELAY_SECONDS)
-        judge_dt = entry_dt + timedelta(seconds=JUDGE_DELAY_SECONDS)
+        judge_dt = now + timedelta(seconds=JUDGE_DELAY_SECONDS)
 
-        entry_time = entry_dt.strftime("%Y/%m/%d %H:%M:%S")
+        entry_time = now.strftime("%Y/%m/%d %H:%M:%S")
         judge_time = judge_dt.strftime("%Y/%m/%d %H:%M:%S")
 
-        pre_message = (
-            f"🟡【事前通知｜2分前】\n\n"
-            f"まだエントリーしない\n\n"
-            f"通貨: {pair}\n"
-            f"足種: {timeframe}\n"
-            f"方向: {signal}\n"
-            f"シグナル時価格: {signal_price}\n\n"
-            f"エントリー予定時刻: {entry_time}\n"
-            f"判定予定時刻: {judge_time}"
-        )
+        entry_price = get_usdjpy_price()
+        entry_price_text = format_price(entry_price)
+        log("ENTRY PRICE:", entry_price)
 
-        if send_line_message(pre_message):
-            log("PRE NOTICE SENT")
-
-        row_number = append_pending_row(
+        row_number = append_entry_row(
             pair=pair,
             timeframe=timeframe,
             signal=signal,
             entry_time=entry_time,
+            entry_price=entry_price_text,
             judge_time=judge_time
         )
 
+        message = (
+            f"🔴【即エントリー通知】\n\n"
+            f"今すぐエントリー\n\n"
+            f"通貨: {pair}\n"
+            f"足種: {timeframe}\n"
+            f"方向: {signal}\n"
+            f"エントリー価格: {entry_price_text}\n"
+            f"判定予定時刻: {judge_time}"
+        )
+
+        if send_line_message(message):
+            log("ENTRY NOTICE SENT")
+
         timer = threading.Timer(
-            ENTRY_DELAY_SECONDS,
-            send_entry_and_schedule_judgement,
-            args=[signal, pair, timeframe, row_number, signal_price]
+            JUDGE_DELAY_SECONDS,
+            judge_and_update_sheet,
+            args=[signal, pair, timeframe, row_number, entry_price]
         )
         timer.daemon = True
         timer.start()
@@ -589,7 +505,20 @@ def home():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(silent=True)
+        if data is None and request.data:
+            try:
+                data = json.loads(request.data.decode("utf-8"))
+            except Exception:
+                data = None
+
+        if not isinstance(data, dict):
+            log("INVALID PAYLOAD SKIPPED:", data)
+            return {
+                "status": "accepted",
+                "message": "Invalid payload skipped."
+            }, 200
+
         received_at = datetime.now(JST)
 
         log("RECEIVED:", data)
