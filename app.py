@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
+APP_VERSION = "immediate entry v2"
+
 LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -61,6 +63,9 @@ def log(message, *values):
 
 def log_error(stage, error):
     log(f"ERROR [{stage}]: {type(error).__name__}: {error}")
+
+
+log("APP VERSION:", APP_VERSION)
 
 
 def send_line_message(message):
@@ -356,6 +361,17 @@ def format_price(price):
     return f"{float(price):.3f}"
 
 
+def format_optional_price(price):
+    text = str(price or "").strip()
+    if not text:
+        return "N/A"
+
+    try:
+        return format_price(text)
+    except (TypeError, ValueError):
+        return text
+
+
 def update_result(row_number, judge_price, result):
     try:
         sheet = get_history_sheet()
@@ -420,6 +436,13 @@ def process_signal(data):
         signal = str(data.get("signal", "UNKNOWN")).strip().upper()
         pair = str(data.get("pair", "USDJPY")).strip()
         timeframe = str(data.get("timeframe", "5")).strip()
+        signal_price = str(data.get("signal_price", "")).strip()
+        signal_price_text = format_optional_price(signal_price)
+
+        log("SIGNAL:", signal)
+        log("PAIR:", pair)
+        log("TIMEFRAME:", timeframe)
+        log("SIGNAL PRICE:", signal_price_text)
 
         now = datetime.now(JST)
         judge_dt = now + timedelta(seconds=JUDGE_DELAY_SECONDS)
@@ -446,6 +469,7 @@ def process_signal(data):
             f"通貨: {pair}\n"
             f"足種: {timeframe}\n"
             f"方向: {signal}\n"
+            f"シグナル時価格: {signal_price_text}\n"
             f"エントリー価格: {entry_price_text}\n"
             f"判定予定時刻: {judge_time}"
         )
@@ -467,13 +491,16 @@ def process_signal(data):
 
 
 def build_duplicate_key(data, received_at):
-    received_minute = received_at.strftime("%Y/%m/%d %H:%M")
+    alert_time = str(data.get("alert_time", "")).strip()
+    received_second = received_at.strftime("%Y/%m/%d %H:%M:%S")
+    signal_time = alert_time or received_second
+
     return (
         str(data.get("signal", "")).strip().upper(),
         str(data.get("pair", "")).strip(),
         str(data.get("timeframe", "")).strip(),
         str(data.get("signal_price", "")).strip(),
-        received_minute
+        signal_time
     )
 
 
@@ -497,9 +524,22 @@ def is_duplicate_signal(data, received_at):
         return False
 
 
+def handle_received_signal(data, received_at):
+    try:
+        if is_duplicate_signal(data, received_at):
+            log("DUPLICATE SIGNAL SKIPPED:", data)
+            return
+
+        process_signal(data)
+
+    except Exception as e:
+        log_error("WEBHOOK WORKER", e)
+        notify_error("Webhookバックグラウンド処理エラー", e)
+
+
 @app.route("/")
 def home():
-    return "BO Signal Bot Running"
+    return f"BO Signal Bot Running - {APP_VERSION}"
 
 
 @app.route("/webhook", methods=["POST"])
@@ -523,16 +563,9 @@ def webhook():
 
         log("RECEIVED:", data)
 
-        if is_duplicate_signal(data, received_at):
-            log("DUPLICATE SIGNAL SKIPPED:", data)
-            return {
-                "status": "accepted",
-                "message": "Duplicate signal skipped."
-            }, 200
-
         worker = threading.Thread(
-            target=process_signal,
-            args=[data]
+            target=handle_received_signal,
+            args=[data, received_at]
         )
         worker.daemon = True
         worker.start()
