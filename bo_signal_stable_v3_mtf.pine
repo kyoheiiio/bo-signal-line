@@ -1,0 +1,39 @@
+//@version=5
+indicator("BO Signal Stable V3 MTF", overlay=true, max_labels_count=500)
+
+fastLength = input.int(9, "Fast EMA Length", minval=1)
+slowLength = input.int(21, "Slow EMA Length", minval=1)
+rsiLength = input.int(14, "RSI Length", minval=1)
+highRsiLevel = input.int(55, "HIGH RSI Level", minval=1, maxval=100)
+lowRsiLevel = input.int(45, "LOW RSI Level", minval=1, maxval=100)
+mtfTimeframe = input.timeframe("5", "MTF Trend Timeframe")
+useMtfFilter = input.bool(true, "Use MTF Trend Filter")
+showEma = input.bool(true, "Show EMAs")
+
+fastEma = ta.ema(close, fastLength)
+slowEma = ta.ema(close, slowLength)
+rsiValue = ta.rsi(close, rsiLength)
+
+mtfFastEma = request.security(syminfo.tickerid, mtfTimeframe, ta.ema(close, fastLength), barmerge.gaps_off, barmerge.lookahead_off)
+mtfSlowEma = request.security(syminfo.tickerid, mtfTimeframe, ta.ema(close, slowLength), barmerge.gaps_off, barmerge.lookahead_off)
+
+mtfTrendUp = mtfFastEma > mtfSlowEma
+mtfTrendDown = mtfFastEma < mtfSlowEma
+
+highSignal = barstate.isconfirmed and ta.crossover(fastEma, slowEma) and rsiValue >= highRsiLevel and (not useMtfFilter or mtfTrendUp)
+lowSignal = barstate.isconfirmed and ta.crossunder(fastEma, slowEma) and rsiValue <= lowRsiLevel and (not useMtfFilter or mtfTrendDown)
+
+plot(showEma ? fastEma : na, "Fast EMA", color=color.new(color.teal, 0), linewidth=2)
+plot(showEma ? slowEma : na, "Slow EMA", color=color.new(color.orange, 0), linewidth=2)
+
+plotshape(highSignal, title="HIGH Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.red, 0), text="HIGH", textcolor=color.white, size=size.small)
+plotshape(lowSignal, title="LOW Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.blue, 0), text="LOW", textcolor=color.white, size=size.small)
+
+alertcondition(highSignal, title="HIGH Signal", message="{\"signal\":\"HIGH\",\"pair\":\"USDJPY\",\"timeframe\":\"{{interval}}\",\"signal_price\":\"{{close}}\",\"alert_time\":\"{{time}}\"}")
+alertcondition(lowSignal, title="LOW Signal", message="{\"signal\":\"LOW\",\"pair\":\"USDJPY\",\"timeframe\":\"{{interval}}\",\"signal_price\":\"{{close}}\",\"alert_time\":\"{{time}}\"}")
+
+if highSignal
+    alert("{\"signal\":\"HIGH\",\"pair\":\"USDJPY\",\"timeframe\":\"{{interval}}\",\"signal_price\":\"{{close}}\",\"alert_time\":\"{{time}}\"}", alert.freq_once_per_bar_close)
+
+if lowSignal
+    alert("{\"signal\":\"LOW\",\"pair\":\"USDJPY\",\"timeframe\":\"{{interval}}\",\"signal_price\":\"{{close}}\",\"alert_time\":\"{{time}}\"}", alert.freq_once_per_bar_close)
