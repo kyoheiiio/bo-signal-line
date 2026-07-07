@@ -12,9 +12,8 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v2"
+APP_VERSION = "immediate entry v3 line aliases"
 
-LINE_ACCESS_TOKEN = os.getenv("LINE_ACCESS_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
@@ -68,17 +67,68 @@ def log_error(stage, error):
 log("APP VERSION:", APP_VERSION)
 
 
+def get_line_access_token():
+    return (
+        os.getenv("LINE_ACCESS_TOKEN")
+        or os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+        or os.getenv("LINE_BOT_CHANNEL_ACCESS_TOKEN")
+        or os.getenv("LINE_BOT_TOKEN")
+        or os.getenv("LINE_CHANNEL_TOKEN")
+    )
+
+
+def get_line_targets():
+    line_to = (
+        os.getenv("LINE_TO")
+        or os.getenv("LINE_USER_ID")
+        or os.getenv("LINE_GROUP_ID")
+        or os.getenv("LINE_USER_IDS")
+        or os.getenv("LINE_GROUP_IDS")
+    )
+    if not line_to:
+        return []
+    return [target.strip() for target in line_to.split(",") if target.strip()]
+
+
+def line_config_status():
+    token_exists = bool(get_line_access_token())
+    targets = get_line_targets()
+    return {
+        "line_token": token_exists,
+        "line_to": bool(targets),
+        "line_target_count": len(targets),
+        "delivery_mode": (
+            "push" if len(targets) == 1
+            else "multicast" if len(targets) > 1
+            else "broadcast" if token_exists
+            else "not_configured"
+        )
+    }
+
+
 def send_line_message(message):
     try:
-        if not LINE_ACCESS_TOKEN:
-            raise RuntimeError("LINE_ACCESS_TOKEN is not set")
+        line_access_token = get_line_access_token()
+        if not line_access_token:
+            raise RuntimeError("LINE access token is not set")
 
-        url = "https://api.line.me/v2/bot/message/broadcast"
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
+            "Authorization": f"Bearer {line_access_token}"
         }
-        payload = {"messages": [{"type": "text", "text": message}]}
+        messages = [{"type": "text", "text": message}]
+        targets = get_line_targets()
+
+        if len(targets) == 1:
+            url = "https://api.line.me/v2/bot/message/push"
+            payload = {"to": targets[0], "messages": messages}
+        elif len(targets) > 1:
+            url = "https://api.line.me/v2/bot/message/multicast"
+            payload = {"to": targets, "messages": messages}
+        else:
+            url = "https://api.line.me/v2/bot/message/broadcast"
+            payload = {"messages": messages}
+
         response = requests.post(url, headers=headers, json=payload, timeout=10)
 
         log("LINE STATUS:", response.status_code)
@@ -540,6 +590,44 @@ def handle_received_signal(data, received_at):
 @app.route("/")
 def home():
     return f"BO Signal Bot Running - {APP_VERSION}"
+
+
+@app.route("/health")
+def health():
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "line_config": line_config_status()
+    }, 200
+
+
+@app.route("/line-test", methods=["POST"])
+def line_test():
+    test_secret = os.getenv("LINE_TEST_SECRET")
+    if not test_secret:
+        return {"status": "disabled"}, 404
+
+    provided_secret = request.headers.get("X-Line-Test-Secret") or request.args.get("secret")
+    if provided_secret != test_secret:
+        return {"status": "forbidden"}, 403
+
+    data = request.get_json(silent=True) or {}
+    message = str(data.get("message", "")).strip() or (
+        "LINE test from BO Signal Bot\n"
+        f"version: {APP_VERSION}\n"
+        f"time: {datetime.now(JST).strftime('%Y/%m/%d %H:%M:%S')}"
+    )
+
+    if send_line_message(message):
+        return {
+            "status": "sent",
+            "line_config": line_config_status()
+        }, 200
+
+    return {
+        "status": "error",
+        "line_config": line_config_status()
+    }, 500
 
 
 @app.route("/webhook", methods=["POST"])
