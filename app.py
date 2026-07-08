@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v3 line aliases"
+APP_VERSION = "immediate entry v4 theoption hours"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -25,6 +25,12 @@ SYMBOL = "USD/JPY"
 HISTORY_SHEET_NAME = "履歴"
 SUMMARY_SHEET_NAME = "日別集計"
 DUPLICATE_WINDOW_SECONDS = 120
+THEOPTION_HOURS_FILTER_ENABLED = os.getenv(
+    "THEOPTION_HOURS_FILTER_ENABLED",
+    "true"
+).strip().lower() not in ("0", "false", "no", "off")
+THEOPTION_START_HOUR = 8
+THEOPTION_END_HOUR = 6
 
 HISTORY_HEADERS = [
     "日時",
@@ -104,6 +110,78 @@ def line_config_status():
             else "not_configured"
         )
     }
+
+
+def get_theoption_session_window(current_dt):
+    if current_dt.tzinfo is None:
+        current_dt = current_dt.replace(tzinfo=JST)
+
+    if current_dt.hour >= THEOPTION_START_HOUR:
+        session_day = current_dt.date()
+    elif current_dt.hour < THEOPTION_END_HOUR:
+        session_day = (current_dt - timedelta(days=1)).date()
+    else:
+        return None
+
+    session_start = datetime(
+        session_day.year,
+        session_day.month,
+        session_day.day,
+        THEOPTION_START_HOUR,
+        0,
+        0,
+        tzinfo=JST
+    )
+    session_end = session_start + timedelta(days=1)
+    session_end = session_end.replace(hour=THEOPTION_END_HOUR, minute=0, second=0, microsecond=0)
+    return session_start, session_end
+
+
+def theoption_hours_status(received_at=None, judge_delay_seconds=JUDGE_DELAY_SECONDS):
+    received_at = received_at or datetime.now(JST)
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=JST)
+    judge_at = received_at + timedelta(seconds=judge_delay_seconds)
+    session_window = get_theoption_session_window(received_at)
+
+    status = {
+        "enabled": THEOPTION_HOURS_FILTER_ENABLED,
+        "allowed": False,
+        "now": received_at.strftime("%Y/%m/%d %H:%M:%S"),
+        "judge_time": judge_at.strftime("%Y/%m/%d %H:%M:%S"),
+        "session_start": None,
+        "session_end": None,
+        "reason": ""
+    }
+
+    if not THEOPTION_HOURS_FILTER_ENABLED:
+        status["allowed"] = True
+        status["reason"] = "filter disabled"
+        return status
+
+    if session_window is None:
+        status["reason"] = "outside theoption USDJPY session"
+        return status
+
+    session_start, session_end = session_window
+    status["session_start"] = session_start.strftime("%Y/%m/%d %H:%M:%S")
+    status["session_end"] = session_end.strftime("%Y/%m/%d %H:%M:%S")
+
+    if session_start.weekday() > 4:
+        status["reason"] = "weekend session"
+        return status
+
+    if received_at < session_start or received_at >= session_end:
+        status["reason"] = "outside theoption USDJPY session"
+        return status
+
+    if judge_at >= session_end:
+        status["reason"] = "judge time exceeds session close"
+        return status
+
+    status["allowed"] = True
+    status["reason"] = "inside theoption USDJPY session"
+    return status
 
 
 def send_line_message(message):
@@ -576,6 +654,11 @@ def is_duplicate_signal(data, received_at):
 
 def handle_received_signal(data, received_at):
     try:
+        hours_status = theoption_hours_status(received_at)
+        if not hours_status["allowed"]:
+            log("THEOPTION HOURS SKIPPED:", hours_status, data)
+            return
+
         if is_duplicate_signal(data, received_at):
             log("DUPLICATE SIGNAL SKIPPED:", data)
             return
@@ -597,7 +680,8 @@ def health():
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "line_config": line_config_status()
+        "line_config": line_config_status(),
+        "theoption_hours": theoption_hours_status()
     }, 200
 
 
