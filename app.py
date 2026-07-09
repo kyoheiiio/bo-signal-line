@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v4 theoption hours"
+APP_VERSION = "immediate entry v5 pre entry notice"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -618,12 +618,50 @@ def process_signal(data):
         notify_error("シグナル処理エラー", e)
 
 
+def is_pre_entry_notice(data):
+    notice = str(data.get("notice", data.get("type", ""))).strip().upper()
+    return notice in ("PRE_ENTRY", "PRE", "ENTRY_PREVIEW")
+
+
+def process_pre_entry_notice(data):
+    try:
+        log("PRE ENTRY NOTICE START:", data)
+
+        signal = str(data.get("signal", "UNKNOWN")).strip().upper()
+        pair = str(data.get("pair", "USDJPY")).strip()
+        timeframe = str(data.get("timeframe", "1")).strip()
+        signal_price = str(data.get("signal_price", "")).strip()
+        signal_price_text = format_optional_price(signal_price)
+        alert_time = str(data.get("alert_time", "")).strip()
+        now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+
+        message = (
+            f"🟡【エントリー予告】\n\n"
+            f"まだ確定ではありません。\n"
+            f"このまま1分足が確定するとエントリー通知になる可能性があります。\n\n"
+            f"通貨: {pair}\n"
+            f"足種: {timeframe}\n"
+            f"方向: {signal}\n"
+            f"現在価格: {signal_price_text}\n"
+            f"TradingView時刻: {alert_time or 'N/A'}\n"
+            f"受信時刻: {now}"
+        )
+
+        if send_line_message(message):
+            log("PRE ENTRY NOTICE SENT")
+
+    except Exception as e:
+        log_error("PRE ENTRY NOTICE", e)
+        notify_error("エントリー予告処理エラー", e)
+
+
 def build_duplicate_key(data, received_at):
     alert_time = str(data.get("alert_time", "")).strip()
     received_second = received_at.strftime("%Y/%m/%d %H:%M:%S")
     signal_time = alert_time or received_second
 
     return (
+        str(data.get("notice", data.get("type", ""))).strip().upper(),
         str(data.get("signal", "")).strip().upper(),
         str(data.get("pair", "")).strip(),
         str(data.get("timeframe", "")).strip(),
@@ -661,6 +699,10 @@ def handle_received_signal(data, received_at):
 
         if is_duplicate_signal(data, received_at):
             log("DUPLICATE SIGNAL SKIPPED:", data)
+            return
+
+        if is_pre_entry_notice(data):
+            process_pre_entry_notice(data)
             return
 
         process_signal(data)
