@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v5 pre entry notice"
+APP_VERSION = "immediate entry v6 pre entry status notice"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -618,33 +618,65 @@ def process_signal(data):
         notify_error("シグナル処理エラー", e)
 
 
-def is_pre_entry_notice(data):
+def get_notice_type(data):
     notice = str(data.get("notice", data.get("type", ""))).strip().upper()
-    return notice in ("PRE_ENTRY", "PRE", "ENTRY_PREVIEW")
+    return notice
+
+
+def is_pre_entry_notice(data):
+    return get_notice_type(data) in (
+        "PRE_ENTRY",
+        "PRE",
+        "ENTRY_PREVIEW",
+        "PRE_ENTRY_CANCEL",
+        "PRE_ENTRY_PENDING"
+    )
 
 
 def process_pre_entry_notice(data):
     try:
         log("PRE ENTRY NOTICE START:", data)
 
+        notice = get_notice_type(data)
         signal = str(data.get("signal", "UNKNOWN")).strip().upper()
         pair = str(data.get("pair", "USDJPY")).strip()
         timeframe = str(data.get("timeframe", "1")).strip()
         signal_price = str(data.get("signal_price", "")).strip()
         signal_price_text = format_optional_price(signal_price)
         alert_time = str(data.get("alert_time", "")).strip()
+        reason = str(data.get("reason", "")).strip()
         now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
+        if notice in ("PRE_ENTRY_CANCEL",):
+            title = "⚪【エントリー予告取消】"
+            body = (
+                "予告後、1分足確定時に条件が崩れました。\n"
+                "今回はエントリー見送りです。"
+            )
+        elif notice in ("PRE_ENTRY_PENDING",):
+            title = "🟠【エントリー予告 保留】"
+            body = (
+                "予告から1分を過ぎましたが、確定エントリー/取消を確認できません。\n"
+                "TradingView側の状態を確認してください。"
+            )
+        else:
+            title = "🟡【エントリー予告】"
+            body = (
+                "まだ確定ではありません。\n"
+                "このまま1分足が確定するとエントリー通知になる可能性があります。"
+            )
+
+        reason_line = f"\n理由: {reason}" if reason else ""
         message = (
-            f"🟡【エントリー予告】\n\n"
-            f"まだ確定ではありません。\n"
-            f"このまま1分足が確定するとエントリー通知になる可能性があります。\n\n"
+            f"{title}\n\n"
+            f"{body}\n\n"
             f"通貨: {pair}\n"
             f"足種: {timeframe}\n"
             f"方向: {signal}\n"
             f"現在価格: {signal_price_text}\n"
             f"TradingView時刻: {alert_time or 'N/A'}\n"
             f"受信時刻: {now}"
+            f"{reason_line}"
         )
 
         if send_line_message(message):
