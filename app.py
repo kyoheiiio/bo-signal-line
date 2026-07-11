@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v6 pre entry status notice"
+APP_VERSION = "immediate entry v7 btcusd weekend"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -21,7 +21,6 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 JST = ZoneInfo("Asia/Tokyo")
 
 JUDGE_DELAY_SECONDS = 300
-SYMBOL = "USD/JPY"
 HISTORY_SHEET_NAME = "履歴"
 SUMMARY_SHEET_NAME = "日別集計"
 DUPLICATE_WINDOW_SECONDS = 120
@@ -31,6 +30,34 @@ THEOPTION_HOURS_FILTER_ENABLED = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off")
 THEOPTION_START_HOUR = 8
 THEOPTION_END_HOUR = 6
+
+PAIR_SETTINGS = {
+    "USDJPY": {
+        "display": "USDJPY",
+        "symbol": "USD/JPY",
+        "price_decimals": 3,
+        "start_hour": 8,
+        "end_hour": 6,
+        "weekdays_only": True,
+        "session_name": "theoption USDJPY"
+    },
+    "BTCUSD": {
+        "display": "BTC/USD",
+        "symbol": "BTC/USD",
+        "price_decimals": 2,
+        "start_hour": 8,
+        "end_hour": 5,
+        "weekdays_only": False,
+        "session_name": "theoption BTC/USD"
+    }
+}
+
+PAIR_ALIASES = {
+    "USDJPY": "USDJPY",
+    "USDJPYFX": "USDJPY",
+    "BTCUSD": "BTCUSD",
+    "BTCUSDT": "BTCUSD"
+}
 
 HISTORY_HEADERS = [
     "日時",
@@ -73,6 +100,25 @@ def log_error(stage, error):
 log("APP VERSION:", APP_VERSION)
 
 
+def normalize_pair(pair):
+    text = str(pair or "USDJPY").strip().upper()
+    compact = (
+        text.replace("/", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace(" ", "")
+    )
+    return PAIR_ALIASES.get(compact, compact)
+
+
+def get_pair_settings(pair):
+    return PAIR_SETTINGS.get(normalize_pair(pair), PAIR_SETTINGS["USDJPY"])
+
+
+def display_pair(pair):
+    return get_pair_settings(pair)["display"]
+
+
 def get_line_access_token():
     return (
         os.getenv("LINE_ACCESS_TOKEN")
@@ -112,13 +158,13 @@ def line_config_status():
     }
 
 
-def get_theoption_session_window(current_dt):
+def get_theoption_session_window(current_dt, start_hour=THEOPTION_START_HOUR, end_hour=THEOPTION_END_HOUR):
     if current_dt.tzinfo is None:
         current_dt = current_dt.replace(tzinfo=JST)
 
-    if current_dt.hour >= THEOPTION_START_HOUR:
+    if current_dt.hour >= start_hour:
         session_day = current_dt.date()
-    elif current_dt.hour < THEOPTION_END_HOUR:
+    elif current_dt.hour < end_hour:
         session_day = (current_dt - timedelta(days=1)).date()
     else:
         return None
@@ -127,30 +173,44 @@ def get_theoption_session_window(current_dt):
         session_day.year,
         session_day.month,
         session_day.day,
-        THEOPTION_START_HOUR,
+        start_hour,
         0,
         0,
         tzinfo=JST
     )
     session_end = session_start + timedelta(days=1)
-    session_end = session_end.replace(hour=THEOPTION_END_HOUR, minute=0, second=0, microsecond=0)
+    session_end = session_end.replace(hour=end_hour, minute=0, second=0, microsecond=0)
     return session_start, session_end
 
 
-def theoption_hours_status(received_at=None, judge_delay_seconds=JUDGE_DELAY_SECONDS):
+def theoption_hours_status(pair="USDJPY", received_at=None, judge_delay_seconds=JUDGE_DELAY_SECONDS):
+    if isinstance(pair, datetime):
+        received_at = pair
+        pair = "USDJPY"
+
+    pair_key = normalize_pair(pair)
+    settings = get_pair_settings(pair_key)
     received_at = received_at or datetime.now(JST)
     if received_at.tzinfo is None:
         received_at = received_at.replace(tzinfo=JST)
     judge_at = received_at + timedelta(seconds=judge_delay_seconds)
-    session_window = get_theoption_session_window(received_at)
+    session_window = get_theoption_session_window(
+        received_at,
+        start_hour=settings["start_hour"],
+        end_hour=settings["end_hour"]
+    )
 
     status = {
         "enabled": THEOPTION_HOURS_FILTER_ENABLED,
+        "pair": settings["display"],
         "allowed": False,
         "now": received_at.strftime("%Y/%m/%d %H:%M:%S"),
         "judge_time": judge_at.strftime("%Y/%m/%d %H:%M:%S"),
         "session_start": None,
         "session_end": None,
+        "start_hour": settings["start_hour"],
+        "end_hour": settings["end_hour"],
+        "weekdays_only": settings["weekdays_only"],
         "reason": ""
     }
 
@@ -160,19 +220,19 @@ def theoption_hours_status(received_at=None, judge_delay_seconds=JUDGE_DELAY_SEC
         return status
 
     if session_window is None:
-        status["reason"] = "outside theoption USDJPY session"
+        status["reason"] = f"outside {settings['session_name']} session"
         return status
 
     session_start, session_end = session_window
     status["session_start"] = session_start.strftime("%Y/%m/%d %H:%M:%S")
     status["session_end"] = session_end.strftime("%Y/%m/%d %H:%M:%S")
 
-    if session_start.weekday() > 4:
+    if settings["weekdays_only"] and session_start.weekday() > 4:
         status["reason"] = "weekend session"
         return status
 
     if received_at < session_start or received_at >= session_end:
-        status["reason"] = "outside theoption USDJPY session"
+        status["reason"] = f"outside {settings['session_name']} session"
         return status
 
     if judge_at >= session_end:
@@ -180,7 +240,7 @@ def theoption_hours_status(received_at=None, judge_delay_seconds=JUDGE_DELAY_SEC
         return status
 
     status["allowed"] = True
-    status["reason"] = "inside theoption USDJPY session"
+    status["reason"] = f"inside {settings['session_name']} session"
     return status
 
 
@@ -227,14 +287,15 @@ def notify_error(title, error):
     send_line_message(message)
 
 
-def get_usdjpy_price():
+def get_price_for_pair(pair):
     try:
         if not TWELVE_DATA_API_KEY:
             raise RuntimeError("TWELVE_DATA_API_KEY is not set")
 
+        settings = get_pair_settings(pair)
         url = "https://api.twelvedata.com/price"
         params = {
-            "symbol": SYMBOL,
+            "symbol": settings["symbol"],
             "apikey": TWELVE_DATA_API_KEY
         }
         response = requests.get(url, params=params, timeout=10)
@@ -252,6 +313,10 @@ def get_usdjpy_price():
     except Exception as e:
         log_error("TWELVE DATA PRICE", e)
         raise
+
+
+def get_usdjpy_price():
+    return get_price_for_pair("USDJPY")
 
 
 def get_spreadsheet():
@@ -485,17 +550,18 @@ def append_entry_row(pair, timeframe, signal, entry_time, entry_price, judge_tim
         raise
 
 
-def format_price(price):
-    return f"{float(price):.3f}"
+def format_price(price, pair="USDJPY"):
+    decimals = get_pair_settings(pair)["price_decimals"]
+    return f"{float(price):.{decimals}f}"
 
 
-def format_optional_price(price):
+def format_optional_price(price, pair="USDJPY"):
     text = str(price or "").strip()
     if not text:
         return "N/A"
 
     try:
-        return format_price(text)
+        return format_price(text, pair)
     except (TypeError, ValueError):
         return text
 
@@ -532,8 +598,8 @@ def judge_result(signal, entry_price, judge_price):
 
 def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
     try:
-        judge_price = get_usdjpy_price()
-        judge_price_text = format_price(judge_price)
+        judge_price = get_price_for_pair(pair)
+        judge_price_text = format_price(judge_price, pair)
         log("JUDGE PRICE:", judge_price)
 
         result = judge_result(signal, entry_price, judge_price)
@@ -544,7 +610,7 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
             f"通貨: {pair}\n"
             f"足種: {timeframe}\n"
             f"方向: {signal}\n\n"
-            f"エントリー価格: {format_price(entry_price)}\n"
+            f"エントリー価格: {format_price(entry_price, pair)}\n"
             f"判定終了価格: {judge_price_text}\n"
             f"結果: {result}"
         )
@@ -562,10 +628,10 @@ def process_signal(data):
         log("PROCESS START:", data)
 
         signal = str(data.get("signal", "UNKNOWN")).strip().upper()
-        pair = str(data.get("pair", "USDJPY")).strip()
+        pair = display_pair(data.get("pair", "USDJPY"))
         timeframe = str(data.get("timeframe", "5")).strip()
         signal_price = str(data.get("signal_price", "")).strip()
-        signal_price_text = format_optional_price(signal_price)
+        signal_price_text = format_optional_price(signal_price, pair)
 
         log("SIGNAL:", signal)
         log("PAIR:", pair)
@@ -578,8 +644,8 @@ def process_signal(data):
         entry_time = now.strftime("%Y/%m/%d %H:%M:%S")
         judge_time = judge_dt.strftime("%Y/%m/%d %H:%M:%S")
 
-        entry_price = get_usdjpy_price()
-        entry_price_text = format_price(entry_price)
+        entry_price = get_price_for_pair(pair)
+        entry_price_text = format_price(entry_price, pair)
         log("ENTRY PRICE:", entry_price)
 
         row_number = append_entry_row(
@@ -639,10 +705,10 @@ def process_pre_entry_notice(data):
 
         notice = get_notice_type(data)
         signal = str(data.get("signal", "UNKNOWN")).strip().upper()
-        pair = str(data.get("pair", "USDJPY")).strip()
+        pair = display_pair(data.get("pair", "USDJPY"))
         timeframe = str(data.get("timeframe", "1")).strip()
         signal_price = str(data.get("signal_price", "")).strip()
-        signal_price_text = format_optional_price(signal_price)
+        signal_price_text = format_optional_price(signal_price, pair)
         alert_time = str(data.get("alert_time", "")).strip()
         reason = str(data.get("reason", "")).strip()
         now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
@@ -724,7 +790,8 @@ def is_duplicate_signal(data, received_at):
 
 def handle_received_signal(data, received_at):
     try:
-        hours_status = theoption_hours_status(received_at)
+        pair = data.get("pair", "USDJPY")
+        hours_status = theoption_hours_status(pair, received_at)
         if not hours_status["allowed"]:
             log("THEOPTION HOURS SKIPPED:", hours_status, data)
             return
@@ -755,7 +822,11 @@ def health():
         "status": "ok",
         "version": APP_VERSION,
         "line_config": line_config_status(),
-        "theoption_hours": theoption_hours_status()
+        "theoption_hours": theoption_hours_status("USDJPY"),
+        "theoption_hours_by_pair": {
+            "USDJPY": theoption_hours_status("USDJPY"),
+            "BTCUSD": theoption_hours_status("BTCUSD")
+        }
     }, 200
 
 
