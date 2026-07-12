@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v7 btcusd weekend"
+APP_VERSION = "immediate entry v8 pair schedule"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -39,6 +39,7 @@ PAIR_SETTINGS = {
         "start_hour": 8,
         "end_hour": 6,
         "weekdays_only": True,
+        "weekends_only": False,
         "session_name": "theoption USDJPY"
     },
     "BTCUSD": {
@@ -48,6 +49,7 @@ PAIR_SETTINGS = {
         "start_hour": 8,
         "end_hour": 5,
         "weekdays_only": False,
+        "weekends_only": True,
         "session_name": "theoption BTC/USD"
     }
 }
@@ -211,6 +213,7 @@ def theoption_hours_status(pair="USDJPY", received_at=None, judge_delay_seconds=
         "start_hour": settings["start_hour"],
         "end_hour": settings["end_hour"],
         "weekdays_only": settings["weekdays_only"],
+        "weekends_only": settings["weekends_only"],
         "reason": ""
     }
 
@@ -227,8 +230,14 @@ def theoption_hours_status(pair="USDJPY", received_at=None, judge_delay_seconds=
     status["session_start"] = session_start.strftime("%Y/%m/%d %H:%M:%S")
     status["session_end"] = session_end.strftime("%Y/%m/%d %H:%M:%S")
 
-    if settings["weekdays_only"] and session_start.weekday() > 4:
+    session_is_weekend = session_start.weekday() > 4
+
+    if settings["weekdays_only"] and session_is_weekend:
         status["reason"] = "weekend session"
+        return status
+
+    if settings["weekends_only"] and not session_is_weekend:
+        status["reason"] = "weekday session"
         return status
 
     if received_at < session_start or received_at >= session_end:
