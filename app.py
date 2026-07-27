@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v8 pair schedule"
+APP_VERSION = "immediate entry v9 pre-entry no-entry notice"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -704,6 +704,8 @@ def is_pre_entry_notice(data):
         "PRE",
         "ENTRY_PREVIEW",
         "PRE_ENTRY_CANCEL",
+        "PRE_ENTRY_NO_ENTRY",
+        "PRE_ENTRY_NO_ENTRY_1MIN",
         "PRE_ENTRY_PENDING"
     )
 
@@ -720,12 +722,20 @@ def process_pre_entry_notice(data):
         signal_price_text = format_optional_price(signal_price, pair)
         alert_time = str(data.get("alert_time", "")).strip()
         reason = str(data.get("reason", "")).strip()
+        reason_labels = {
+            "signal_lost_on_close": "1分足確定時に条件不成立",
+            "no_entry_after_1min": "予告から1分後にエントリーなし",
+            "no_entry_after_1m_bar_close": "1分足確定時にエントリーなし",
+            "no_entry_after_1m_timeout": "予告から1分経過後にエントリーなし",
+            "no_final_status_after_1min": "予告から1分経過後も最終判定なし"
+        }
+        reason_text = reason_labels.get(reason, reason)
         now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
-        if notice in ("PRE_ENTRY_CANCEL",):
-            title = "⚪【エントリー予告取消】"
+        if notice in ("PRE_ENTRY_CANCEL", "PRE_ENTRY_NO_ENTRY", "PRE_ENTRY_NO_ENTRY_1MIN"):
+            title = "⚪【エントリー中止】"
             body = (
-                "予告後、1分足確定時に条件が崩れました。\n"
+                "予告から約1分後に確定エントリーが出ませんでした。\n"
                 "今回はエントリー見送りです。"
             )
         elif notice in ("PRE_ENTRY_PENDING",):
@@ -741,7 +751,7 @@ def process_pre_entry_notice(data):
                 "このまま1分足が確定するとエントリー通知になる可能性があります。"
             )
 
-        reason_line = f"\n理由: {reason}" if reason else ""
+        reason_line = f"\n理由: {reason_text}" if reason_text else ""
         message = (
             f"{title}\n\n"
             f"{body}\n\n"
