@@ -3,16 +3,17 @@ import requests
 import os
 import threading
 import json
+import time
 import gspread
 from collections import defaultdict
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v9 pre-entry no-entry notice"
+APP_VERSION = "immediate entry v11 sheet retry fallback"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -20,10 +21,34 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 JST = ZoneInfo("Asia/Tokyo")
 
+
+def env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
+def env_int(name, default, minimum=None):
+    try:
+        value = int(str(os.getenv(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
 JUDGE_DELAY_SECONDS = 300
 HISTORY_SHEET_NAME = "履歴"
 SUMMARY_SHEET_NAME = "日別集計"
 DUPLICATE_WINDOW_SECONDS = 120
+LOSS_GUARD_ENABLED = env_bool("LOSS_GUARD_ENABLED", True)
+LOSS_GUARD_DAILY_LOSSES = env_int("LOSS_GUARD_DAILY_LOSSES", 2, minimum=1)
+LOSS_GUARD_LOOKBACK_ENTRIES = env_int("LOSS_GUARD_LOOKBACK_ENTRIES", 5, minimum=1)
+LOSS_GUARD_LOOKBACK_LOSSES = env_int("LOSS_GUARD_LOOKBACK_LOSSES", 2, minimum=1)
+LOSS_GUARD_COOLDOWN_HOURS = env_int("LOSS_GUARD_COOLDOWN_HOURS", 6, minimum=1)
+GOOGLE_API_RETRY_ATTEMPTS = env_int("GOOGLE_API_RETRY_ATTEMPTS", 3, minimum=1)
+GOOGLE_API_RETRY_BASE_SECONDS = env_int("GOOGLE_API_RETRY_BASE_SECONDS", 2, minimum=1)
 THEOPTION_HOURS_FILTER_ENABLED = os.getenv(
     "THEOPTION_HOURS_FILTER_ENABLED",
     "true"
@@ -97,6 +122,52 @@ def log(message, *values):
 
 def log_error(stage, error):
     log(f"ERROR [{stage}]: {type(error).__name__}: {error}")
+
+
+def google_api_retry_config_status():
+    return {
+        "attempts": GOOGLE_API_RETRY_ATTEMPTS,
+        "base_seconds": GOOGLE_API_RETRY_BASE_SECONDS,
+        "retry_statuses": [429, 500, 502, 503, 504]
+    }
+
+
+def google_api_error_status(error):
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None:
+        try:
+            return int(status_code)
+        except (TypeError, ValueError):
+            pass
+
+    text = str(error)
+    for status in (429, 500, 502, 503, 504):
+        if f"[{status}]" in text or f" {status}" in text or f": {status}" in text:
+            return status
+    return None
+
+
+def is_transient_google_api_error(error):
+    return isinstance(error, APIError) and google_api_error_status(error) in (429, 500, 502, 503, 504)
+
+
+def retry_google_operation(label, operation):
+    for attempt in range(1, GOOGLE_API_RETRY_ATTEMPTS + 1):
+        try:
+            return operation()
+        except Exception as e:
+            if not is_transient_google_api_error(e) or attempt >= GOOGLE_API_RETRY_ATTEMPTS:
+                raise
+
+            wait_seconds = GOOGLE_API_RETRY_BASE_SECONDS * attempt
+            log(
+                f"GOOGLE SHEETS RETRY [{label}]:",
+                f"attempt={attempt}",
+                f"status={google_api_error_status(e)}",
+                f"wait={wait_seconds}s"
+            )
+            time.sleep(wait_seconds)
 
 
 log("APP VERSION:", APP_VERSION)
@@ -345,7 +416,10 @@ def get_spreadsheet():
             scopes=scopes
         )
         client = gspread.authorize(credentials)
-        return client.open_by_key(SPREADSHEET_ID)
+        return retry_google_operation(
+            "OPEN SPREADSHEET",
+            lambda: client.open_by_key(SPREADSHEET_ID)
+        )
 
     except Exception as e:
         log_error("GOOGLE SHEETS AUTH", e)
@@ -354,18 +428,21 @@ def get_spreadsheet():
 
 def update_values(worksheet, range_name, values):
     try:
-        try:
-            worksheet.update(
-                range_name=range_name,
-                values=values,
-                value_input_option="USER_ENTERED"
-            )
-        except TypeError:
-            worksheet.update(
-                range_name,
-                values,
-                value_input_option="USER_ENTERED"
-            )
+        def do_update():
+            try:
+                return worksheet.update(
+                    range_name=range_name,
+                    values=values,
+                    value_input_option="USER_ENTERED"
+                )
+            except TypeError:
+                return worksheet.update(
+                    range_name,
+                    values,
+                    value_input_option="USER_ENTERED"
+                )
+
+        retry_google_operation("UPDATE VALUES", do_update)
     except Exception as e:
         log_error("GOOGLE SHEETS UPDATE VALUES", e)
         raise
@@ -376,22 +453,34 @@ def get_or_create_worksheet(sheet_name, headers):
         spreadsheet = get_spreadsheet()
 
         try:
-            worksheet = spreadsheet.worksheet(sheet_name)
+            worksheet = retry_google_operation(
+                f"FIND WORKSHEET {sheet_name}",
+                lambda: spreadsheet.worksheet(sheet_name)
+            )
         except WorksheetNotFound:
             worksheet = None
 
             if sheet_name == HISTORY_SHEET_NAME:
-                worksheets = spreadsheet.worksheets()
+                worksheets = retry_google_operation(
+                    "LIST WORKSHEETS",
+                    spreadsheet.worksheets
+                )
                 if worksheets and worksheets[0].title != SUMMARY_SHEET_NAME:
                     worksheet = worksheets[0]
                     if worksheet.title != HISTORY_SHEET_NAME:
-                        worksheet.update_title(HISTORY_SHEET_NAME)
+                        retry_google_operation(
+                            f"RENAME WORKSHEET {worksheet.title}",
+                            lambda: worksheet.update_title(HISTORY_SHEET_NAME)
+                        )
 
             if worksheet is None:
-                worksheet = spreadsheet.add_worksheet(
-                    title=sheet_name,
-                    rows=1000,
-                    cols=len(headers)
+                worksheet = retry_google_operation(
+                    f"ADD WORKSHEET {sheet_name}",
+                    lambda: spreadsheet.add_worksheet(
+                        title=sheet_name,
+                        rows=1000,
+                        cols=len(headers)
+                    )
                 )
 
         ensure_headers(worksheet, headers)
@@ -405,7 +494,10 @@ def get_or_create_worksheet(sheet_name, headers):
 
 def ensure_headers(worksheet, headers):
     try:
-        first_row = worksheet.row_values(1)
+        first_row = retry_google_operation(
+            "READ HEADERS",
+            lambda: worksheet.row_values(1)
+        )
         if first_row[:len(headers)] == headers:
             return
 
@@ -413,7 +505,10 @@ def ensure_headers(worksheet, headers):
         first_row_looks_like_header = any(value in headers for value in first_row)
 
         if first_row_has_value and not first_row_looks_like_header:
-            worksheet.insert_row(headers, index=1, value_input_option="USER_ENTERED")
+            retry_google_operation(
+                "INSERT HEADERS",
+                lambda: worksheet.insert_row(headers, index=1, value_input_option="USER_ENTERED")
+            )
         else:
             update_values(worksheet, f"A1:{chr(64 + len(headers))}1", [headers])
 
@@ -457,11 +552,142 @@ def normalize_result(value):
     return str(value or "").strip().upper()
 
 
+def parse_history_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    for fmt in (
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y年%m月%d日 %H:%M:%S",
+        "%Y年%m月%d日 %H:%M"
+    ):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=JST)
+        except ValueError:
+            pass
+
+    return None
+
+
+def risk_guard_config_status():
+    return {
+        "enabled": LOSS_GUARD_ENABLED,
+        "daily_losses": LOSS_GUARD_DAILY_LOSSES,
+        "lookback_entries": LOSS_GUARD_LOOKBACK_ENTRIES,
+        "lookback_losses": LOSS_GUARD_LOOKBACK_LOSSES,
+        "cooldown_hours": LOSS_GUARD_COOLDOWN_HOURS
+    }
+
+
+def get_loss_guard_status(pair, received_at=None):
+    pair_display = display_pair(pair)
+    now = received_at or datetime.now(JST)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=JST)
+
+    status = {
+        "enabled": LOSS_GUARD_ENABLED,
+        "allowed": True,
+        "pair": pair_display,
+        "reason": "loss guard disabled",
+        "today_losses": 0,
+        "daily_loss_limit": LOSS_GUARD_DAILY_LOSSES,
+        "recent_entries": 0,
+        "recent_losses": 0,
+        "lookback_entries": LOSS_GUARD_LOOKBACK_ENTRIES,
+        "lookback_loss_limit": LOSS_GUARD_LOOKBACK_LOSSES,
+        "cooldown_hours": LOSS_GUARD_COOLDOWN_HOURS,
+        "cooldown_until": None
+    }
+
+    if not LOSS_GUARD_ENABLED:
+        return status
+
+    status["reason"] = "loss guard clear"
+
+    try:
+        history_sheet = get_history_sheet()
+        rows = retry_google_operation(
+            "LOSS GUARD HISTORY READ",
+            history_sheet.get_all_values
+        )
+    except Exception as e:
+        log_error("LOSS GUARD HISTORY READ", e)
+        status["reason"] = "loss guard unavailable; fail open"
+        return status
+
+    today_key = now.strftime("%Y/%m/%d")
+    completed = []
+
+    for row in rows[1:]:
+        if len(row) < 9:
+            continue
+
+        row_pair = display_pair(row[1] if len(row) > 1 else "")
+        if row_pair != pair_display:
+            continue
+
+        result = normalize_result(row[8])
+        if result not in ("WIN", "LOSE", "DRAW"):
+            continue
+
+        date_key = extract_date(row[0] if len(row) > 0 else "")
+        row_dt = parse_history_datetime(row[0] if len(row) > 0 else "") or parse_history_datetime(row[4] if len(row) > 4 else "")
+
+        completed.append({
+            "date": date_key,
+            "datetime": row_dt,
+            "result": result
+        })
+
+        if date_key == today_key and result == "LOSE":
+            status["today_losses"] += 1
+
+    if status["today_losses"] >= LOSS_GUARD_DAILY_LOSSES:
+        status["allowed"] = False
+        status["reason"] = f"同日{LOSS_GUARD_DAILY_LOSSES}敗に到達"
+        next_day = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        status["cooldown_until"] = next_day.strftime("%Y/%m/%d %H:%M:%S")
+        return status
+
+    recent = completed[-LOSS_GUARD_LOOKBACK_ENTRIES:]
+    status["recent_entries"] = len(recent)
+    status["recent_losses"] = sum(1 for item in recent if item["result"] == "LOSE")
+
+    if status["recent_losses"] >= LOSS_GUARD_LOOKBACK_LOSSES:
+        latest_loss_dt = next(
+            (
+                item["datetime"]
+                for item in reversed(recent)
+                if item["result"] == "LOSE" and item["datetime"] is not None
+            ),
+            None
+        )
+        if latest_loss_dt is not None:
+            cooldown_until = latest_loss_dt + timedelta(hours=LOSS_GUARD_COOLDOWN_HOURS)
+            if now < cooldown_until:
+                status["allowed"] = False
+                status["reason"] = (
+                    f"直近{LOSS_GUARD_LOOKBACK_ENTRIES}回中"
+                    f"{LOSS_GUARD_LOOKBACK_LOSSES}敗に到達"
+                )
+                status["cooldown_until"] = cooldown_until.strftime("%Y/%m/%d %H:%M:%S")
+
+    return status
+
+
 def update_daily_summary():
     try:
         history_sheet = get_history_sheet()
         summary_sheet = get_or_create_worksheet(SUMMARY_SHEET_NAME, SUMMARY_HEADERS)
-        rows = history_sheet.get_all_values()
+        rows = retry_google_operation(
+            "READ HISTORY FOR DAILY SUMMARY",
+            history_sheet.get_all_values
+        )
 
         daily = defaultdict(lambda: {
             "total": 0,
@@ -502,16 +728,19 @@ def update_daily_summary():
                 win_rate
             ])
 
-        summary_sheet.clear()
+        retry_google_operation("CLEAR DAILY SUMMARY", summary_sheet.clear)
         update_values(summary_sheet, f"A1:H{len(values)}", values)
 
         try:
-            summary_sheet.format("H2:H", {
-                "numberFormat": {
-                    "type": "PERCENT",
-                    "pattern": "0.0%"
-                }
-            })
+            retry_google_operation(
+                "FORMAT DAILY SUMMARY",
+                lambda: summary_sheet.format("H2:H", {
+                    "numberFormat": {
+                        "type": "PERCENT",
+                        "pattern": "0.0%"
+                    }
+                })
+            )
         except Exception as e:
             log_error("DAILY SUMMARY FORMAT", e)
 
@@ -546,8 +775,12 @@ def append_entry_row(pair, timeframe, signal, entry_time, entry_price, judge_tim
             ""
         ]
 
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-        row_number = len(sheet.get_all_values())
+        retry_google_operation(
+            "APPEND ENTRY ROW",
+            lambda: sheet.append_row(row, value_input_option="USER_ENTERED")
+        )
+        rows = retry_google_operation("COUNT HISTORY ROWS", sheet.get_all_values)
+        row_number = len(rows)
 
         log("SHEET APPENDED ROW:", row_number)
         safe_update_daily_summary()
@@ -578,8 +811,14 @@ def format_optional_price(price, pair="USDJPY"):
 def update_result(row_number, judge_price, result):
     try:
         sheet = get_history_sheet()
-        sheet.update_cell(row_number, 8, judge_price)
-        sheet.update_cell(row_number, 9, result)
+        retry_google_operation(
+            "UPDATE JUDGE PRICE",
+            lambda: sheet.update_cell(row_number, 8, judge_price)
+        )
+        retry_google_operation(
+            "UPDATE JUDGE RESULT",
+            lambda: sheet.update_cell(row_number, 9, result)
+        )
         log("RESULT UPDATED:", judge_price, result)
         safe_update_daily_summary()
     except Exception as e:
@@ -612,7 +851,15 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
         log("JUDGE PRICE:", judge_price)
 
         result = judge_result(signal, entry_price, judge_price)
-        update_result(row_number, judge_price_text, result)
+        sheet_note = ""
+        if row_number is None:
+            sheet_note = "\n\n記録: エントリー時にGoogle Sheets未記録のため、判定結果も未記録です。"
+        else:
+            try:
+                update_result(row_number, judge_price_text, result)
+            except Exception as e:
+                log_error("SHEET UPDATE RESULT NONBLOCKING", e)
+                sheet_note = "\n\n記録: Google Sheets一時エラーのため、判定結果は未反映です。"
 
         message = (
             f"📊【判定結果】\n\n"
@@ -622,6 +869,7 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
             f"エントリー価格: {format_price(entry_price, pair)}\n"
             f"判定終了価格: {judge_price_text}\n"
             f"結果: {result}"
+            f"{sheet_note}"
         )
 
         if send_line_message(message):
@@ -657,14 +905,20 @@ def process_signal(data):
         entry_price_text = format_price(entry_price, pair)
         log("ENTRY PRICE:", entry_price)
 
-        row_number = append_entry_row(
-            pair=pair,
-            timeframe=timeframe,
-            signal=signal,
-            entry_time=entry_time,
-            entry_price=entry_price_text,
-            judge_time=judge_time
-        )
+        row_number = None
+        sheet_note = ""
+        try:
+            row_number = append_entry_row(
+                pair=pair,
+                timeframe=timeframe,
+                signal=signal,
+                entry_time=entry_time,
+                entry_price=entry_price_text,
+                judge_time=judge_time
+            )
+        except Exception as e:
+            log_error("SHEET APPEND ENTRY ROW NONBLOCKING", e)
+            sheet_note = "\n\n記録: Google Sheets一時エラーのため未記録です。通知と判定は継続します。"
 
         message = (
             f"🔴【即エントリー通知】\n\n"
@@ -675,6 +929,7 @@ def process_signal(data):
             f"シグナル時価格: {signal_price_text}\n"
             f"エントリー価格: {entry_price_text}\n"
             f"判定予定時刻: {judge_time}"
+            f"{sheet_note}"
         )
 
         if send_line_message(message):
@@ -726,6 +981,7 @@ def process_pre_entry_notice(data):
             "signal_lost_on_close": "1分足確定時に条件不成立",
             "no_entry_after_1min": "予告から1分後にエントリーなし",
             "no_entry_after_1m_bar_close": "1分足確定時にエントリーなし",
+            "no_entry_after_next_bar_fallback": "1分足確定通知を取りこぼしたため次の足で中止",
             "no_entry_after_1m_timeout": "予告から1分経過後にエントリーなし",
             "no_final_status_after_1min": "予告から1分経過後も最終判定なし"
         }
@@ -770,6 +1026,63 @@ def process_pre_entry_notice(data):
     except Exception as e:
         log_error("PRE ENTRY NOTICE", e)
         notify_error("エントリー予告処理エラー", e)
+
+
+def is_test_payload(data):
+    fields = (
+        data.get("signal", ""),
+        data.get("timeframe", ""),
+        data.get("reason", ""),
+        data.get("notice", data.get("type", ""))
+    )
+    text = " ".join(str(value) for value in fields).upper()
+    return "TEST" in text or "テスト" in text
+
+
+def should_apply_loss_guard(data):
+    if is_test_payload(data):
+        return False
+
+    notice = get_notice_type(data)
+    if notice in (
+        "PRE_ENTRY_CANCEL",
+        "PRE_ENTRY_NO_ENTRY",
+        "PRE_ENTRY_NO_ENTRY_1MIN",
+        "PRE_ENTRY_PENDING"
+    ):
+        return False
+
+    return True
+
+
+def notify_loss_guard_block(data, guard_status):
+    signal = str(data.get("signal", "UNKNOWN")).strip().upper()
+    pair = display_pair(data.get("pair", "USDJPY"))
+    timeframe = str(data.get("timeframe", "1")).strip()
+    signal_price = str(data.get("signal_price", "")).strip()
+    signal_price_text = format_optional_price(signal_price, pair)
+    notice = get_notice_type(data) or "ENTRY"
+    now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+
+    cooldown_until = guard_status.get("cooldown_until") or "N/A"
+    message = (
+        "🛑【エントリー停止】\n\n"
+        "連敗ストップ条件により、今回は通知/エントリーを停止しました。\n\n"
+        f"通貨: {pair}\n"
+        f"足種: {timeframe}\n"
+        f"方向: {signal}\n"
+        f"通知種別: {notice}\n"
+        f"シグナル時価格: {signal_price_text}\n"
+        f"理由: {guard_status.get('reason', 'loss guard')}\n"
+        f"本日LOSE数: {guard_status.get('today_losses', 0)} / {guard_status.get('daily_loss_limit', LOSS_GUARD_DAILY_LOSSES)}\n"
+        f"直近LOSE数: {guard_status.get('recent_losses', 0)} / {guard_status.get('lookback_loss_limit', LOSS_GUARD_LOOKBACK_LOSSES)}"
+        f"（直近{guard_status.get('lookback_entries', LOSS_GUARD_LOOKBACK_ENTRIES)}回）\n"
+        f"再開目安: {cooldown_until}\n"
+        f"受信時刻: {now}"
+    )
+
+    if send_line_message(message):
+        log("LOSS GUARD BLOCK NOTICE SENT")
 
 
 def build_duplicate_key(data, received_at):
@@ -819,6 +1132,13 @@ def handle_received_signal(data, received_at):
             log("DUPLICATE SIGNAL SKIPPED:", data)
             return
 
+        if should_apply_loss_guard(data):
+            guard_status = get_loss_guard_status(pair, received_at)
+            if not guard_status["allowed"]:
+                log("LOSS GUARD SKIPPED:", guard_status, data)
+                notify_loss_guard_block(data, guard_status)
+                return
+
         if is_pre_entry_notice(data):
             process_pre_entry_notice(data)
             return
@@ -841,6 +1161,8 @@ def health():
         "status": "ok",
         "version": APP_VERSION,
         "line_config": line_config_status(),
+        "loss_guard": risk_guard_config_status(),
+        "google_sheets_retry": google_api_retry_config_status(),
         "theoption_hours": theoption_hours_status("USDJPY"),
         "theoption_hours_by_pair": {
             "USDJPY": theoption_hours_status("USDJPY"),
