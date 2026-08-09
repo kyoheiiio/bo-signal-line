@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v11 sheet retry fallback"
+APP_VERSION = "immediate entry v12 no loss guard"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -42,7 +42,7 @@ JUDGE_DELAY_SECONDS = 300
 HISTORY_SHEET_NAME = "履歴"
 SUMMARY_SHEET_NAME = "日別集計"
 DUPLICATE_WINDOW_SECONDS = 120
-LOSS_GUARD_ENABLED = env_bool("LOSS_GUARD_ENABLED", True)
+LOSS_GUARD_ENABLED = False
 LOSS_GUARD_DAILY_LOSSES = env_int("LOSS_GUARD_DAILY_LOSSES", 2, minimum=1)
 LOSS_GUARD_LOOKBACK_ENTRIES = env_int("LOSS_GUARD_LOOKBACK_ENTRIES", 5, minimum=1)
 LOSS_GUARD_LOOKBACK_LOSSES = env_int("LOSS_GUARD_LOOKBACK_LOSSES", 2, minimum=1)
@@ -1040,19 +1040,7 @@ def is_test_payload(data):
 
 
 def should_apply_loss_guard(data):
-    if is_test_payload(data):
-        return False
-
-    notice = get_notice_type(data)
-    if notice in (
-        "PRE_ENTRY_CANCEL",
-        "PRE_ENTRY_NO_ENTRY",
-        "PRE_ENTRY_NO_ENTRY_1MIN",
-        "PRE_ENTRY_PENDING"
-    ):
-        return False
-
-    return True
+    return False
 
 
 def notify_loss_guard_block(data, guard_status):
