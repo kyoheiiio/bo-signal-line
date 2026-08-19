@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v18 safe entry test diagnostics"
+APP_VERSION = "discord only v19 notification channel"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -50,6 +50,17 @@ LOSS_GUARD_LOOKBACK_LOSSES = env_int("LOSS_GUARD_LOOKBACK_LOSSES", 2, minimum=1)
 LOSS_GUARD_COOLDOWN_HOURS = env_int("LOSS_GUARD_COOLDOWN_HOURS", 6, minimum=1)
 GOOGLE_API_RETRY_ATTEMPTS = env_int("GOOGLE_API_RETRY_ATTEMPTS", 3, minimum=1)
 GOOGLE_API_RETRY_BASE_SECONDS = env_int("GOOGLE_API_RETRY_BASE_SECONDS", 2, minimum=1)
+DISCORD_WEBHOOK_URL = (
+    os.getenv("DISCORD_WEBHOOK_URL")
+    or os.getenv("DISCORD_BO_WEBHOOK_URL")
+    or ""
+).strip()
+DISCORD_USERNAME = os.getenv("DISCORD_USERNAME", "BO Signal Bot").strip()
+DISCORD_AVATAR_URL = os.getenv("DISCORD_AVATAR_URL", "").strip()
+DISCORD_API_RETRY_ATTEMPTS = env_int("DISCORD_API_RETRY_ATTEMPTS", 3, minimum=1)
+DISCORD_API_RETRY_BASE_SECONDS = env_int("DISCORD_API_RETRY_BASE_SECONDS", 2, minimum=1)
+DISCORD_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
+DISCORD_CONTENT_LIMIT = 1900
 LINE_API_RETRY_ATTEMPTS = env_int("LINE_API_RETRY_ATTEMPTS", 3, minimum=1)
 LINE_API_RETRY_BASE_SECONDS = env_int("LINE_API_RETRY_BASE_SECONDS", 2, minimum=1)
 LINE_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
@@ -181,6 +192,30 @@ def line_api_retry_config_status():
         "base_seconds": LINE_API_RETRY_BASE_SECONDS,
         "retry_statuses": list(LINE_API_RETRY_STATUSES)
     }
+
+
+def discord_api_retry_config_status():
+    return {
+        "attempts": DISCORD_API_RETRY_ATTEMPTS,
+        "base_seconds": DISCORD_API_RETRY_BASE_SECONDS,
+        "retry_statuses": list(DISCORD_API_RETRY_STATUSES)
+    }
+
+
+def discord_config_status():
+    return {
+        "enabled": True,
+        "discord_webhook": bool(DISCORD_WEBHOOK_URL),
+        "delivery_mode": "discord_webhook" if DISCORD_WEBHOOK_URL else "not_configured",
+        "username": DISCORD_USERNAME or "default"
+    }
+
+
+def discord_delivery_warnings():
+    warnings = []
+    if not DISCORD_WEBHOOK_URL:
+        warnings.append("DISCORD_WEBHOOK_URL is not set")
+    return warnings
 
 
 def google_api_error_status(error):
@@ -627,100 +662,106 @@ def theoption_hours_status(pair="USDJPY", received_at=None, judge_delay_seconds=
     return status
 
 
-def send_line_message(message):
-    try:
-        line_access_token = get_line_access_token()
-        if not line_access_token:
-            raise RuntimeError("LINE access token is not set")
+def get_last_notification_delivery_result():
+    return get_last_line_delivery_result()
 
-        quota_status = get_line_quota_status()
-        if LINE_QUOTA_GUARD_ENABLED and quota_status.get("exhausted"):
-            set_last_line_delivery_result({
+
+def set_last_notification_delivery_result(result):
+    set_last_line_delivery_result(result)
+
+
+def truncate_discord_content(message):
+    text = str(message)
+    if len(text) <= DISCORD_CONTENT_LIMIT:
+        return text
+    return text[:DISCORD_CONTENT_LIMIT - 20] + "\n...(truncated)"
+
+
+def discord_retry_after_seconds(response, attempt):
+    try:
+        data = response.json()
+        retry_after = data.get("retry_after")
+        if retry_after is not None:
+            return max(float(retry_after), 1.0)
+    except Exception:
+        pass
+    return DISCORD_API_RETRY_BASE_SECONDS * attempt
+
+
+def send_discord_message(message):
+    delivery_mode = "discord_webhook"
+    try:
+        if not DISCORD_WEBHOOK_URL:
+            set_last_notification_delivery_result({
                 "ok": False,
-                "delivery_mode": line_config_status()["delivery_mode"],
-                "error": "LINE monthly message quota is exhausted",
-                "quota": quota_status
+                "channel": "discord",
+                "delivery_mode": "not_configured",
+                "error": "DISCORD_WEBHOOK_URL is not set"
             })
-            log("LINE QUOTA EXHAUSTED:", quota_status)
+            log("DISCORD WEBHOOK MISSING")
             return False
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {line_access_token}"
+        payload = {
+            "content": truncate_discord_content(message),
+            "allowed_mentions": {"parse": []}
         }
-        messages = [{"type": "text", "text": message}]
-        targets, target_source = get_line_targets_with_source()
+        if DISCORD_USERNAME:
+            payload["username"] = DISCORD_USERNAME
+        if DISCORD_AVATAR_URL:
+            payload["avatar_url"] = DISCORD_AVATAR_URL
 
-        if len(targets) == 1:
-            url = "https://api.line.me/v2/bot/message/push"
-            payload = {"to": targets[0], "messages": messages}
-            delivery_mode = "push"
-        elif len(targets) > 1:
-            url = "https://api.line.me/v2/bot/message/multicast"
-            payload = {"to": targets, "messages": messages}
-            delivery_mode = "multicast"
-        else:
-            if not LINE_BROADCAST_FALLBACK_ENABLED:
-                set_last_line_delivery_result({
-                    "ok": False,
-                    "delivery_mode": "no_target",
-                    "target_source": target_source,
-                    "error": "LINE target is not set and broadcast fallback is disabled"
-                })
-                log("LINE TARGET MISSING: broadcast fallback disabled")
-                return False
-
-            url = "https://api.line.me/v2/bot/message/broadcast"
-            payload = {"messages": messages}
-            delivery_mode = "broadcast"
-
-        for attempt in range(1, LINE_API_RETRY_ATTEMPTS + 1):
+        for attempt in range(1, DISCORD_API_RETRY_ATTEMPTS + 1):
+            response = None
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=10)
+                response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
 
-                log("LINE STATUS:", response.status_code, f"attempt={attempt}")
-                log("LINE RESPONSE:", response.text)
+                log("DISCORD STATUS:", response.status_code, f"attempt={attempt}")
+                log("DISCORD RESPONSE:", response.text[:500])
 
                 if response.status_code < 400:
-                    set_last_line_delivery_result({
+                    set_last_notification_delivery_result({
                         "ok": True,
+                        "channel": "discord",
                         "status_code": response.status_code,
                         "attempt": attempt,
                         "delivery_mode": delivery_mode,
-                        "target_source": target_source,
                         "response": response.text[:500]
                     })
                     return True
 
-                error = RuntimeError(f"LINE API error {response.status_code}: {response.text}")
-                set_last_line_delivery_result({
+                error = RuntimeError(f"Discord webhook error {response.status_code}: {response.text}")
+                should_retry = response.status_code in DISCORD_API_RETRY_STATUSES
+                set_last_notification_delivery_result({
                     "ok": False,
+                    "channel": "discord",
                     "status_code": response.status_code,
                     "attempt": attempt,
                     "delivery_mode": delivery_mode,
-                    "target_source": target_source,
                     "response": response.text[:500],
-                    "will_retry": response.status_code in LINE_API_RETRY_STATUSES
+                    "will_retry": should_retry
                 })
-                should_retry = response.status_code in LINE_API_RETRY_STATUSES
             except requests.RequestException as e:
                 error = e
-                set_last_line_delivery_result({
+                should_retry = True
+                set_last_notification_delivery_result({
                     "ok": False,
+                    "channel": "discord",
                     "attempt": attempt,
                     "delivery_mode": delivery_mode,
-                    "target_source": target_source,
                     "error": f"{type(e).__name__}: {e}",
                     "will_retry": True
                 })
-                should_retry = True
 
-            if not should_retry or attempt >= LINE_API_RETRY_ATTEMPTS:
+            if not should_retry or attempt >= DISCORD_API_RETRY_ATTEMPTS:
                 raise error
 
-            wait_seconds = LINE_API_RETRY_BASE_SECONDS * attempt
+            wait_seconds = (
+                discord_retry_after_seconds(response, attempt)
+                if response is not None
+                else DISCORD_API_RETRY_BASE_SECONDS * attempt
+            )
             log(
-                "LINE RETRY:",
+                "DISCORD RETRY:",
                 f"attempt={attempt}",
                 f"wait={wait_seconds}s",
                 f"error={error}"
@@ -730,20 +771,29 @@ def send_line_message(message):
         return False
 
     except Exception as e:
-        current_result = get_last_line_delivery_result()
+        current_result = get_last_notification_delivery_result()
         current_result.update({
             "ok": False,
-            "delivery_mode": line_config_status()["delivery_mode"],
+            "channel": "discord",
+            "delivery_mode": delivery_mode,
             "error": f"{type(e).__name__}: {e}"
         })
-        set_last_line_delivery_result(current_result)
-        log_error("LINE SEND", e)
+        set_last_notification_delivery_result(current_result)
+        log_error("DISCORD SEND", e)
         return False
+
+
+def send_notification_message(message):
+    return send_discord_message(message)
+
+
+def send_line_message(message):
+    return send_notification_message(message)
 
 
 def notify_error(title, error):
     message = f"⚠️ {title}\n{type(error).__name__}: {error}"
-    send_line_message(message)
+    send_notification_message(message)
 
 
 def get_price_for_pair(pair):
@@ -1369,7 +1419,7 @@ def judge_and_update_sheet(signal, pair, timeframe, row_number, entry_price):
             f"{sheet_note}"
         )
 
-        if send_line_message(message):
+        if send_notification_message(message):
             log("JUDGE NOTICE SENT")
 
     except Exception as e:
@@ -1429,7 +1479,7 @@ def process_signal(data):
             f"{sheet_note}"
         )
 
-        sent = send_line_message(message)
+        sent = send_notification_message(message)
         if sent:
             log("ENTRY NOTICE SENT")
 
@@ -1520,7 +1570,7 @@ def process_pre_entry_notice(data):
             f"{reason_line}"
         )
 
-        sent = send_line_message(message)
+        sent = send_notification_message(message)
         if sent:
             log("PRE ENTRY NOTICE SENT")
         return sent
@@ -1568,7 +1618,7 @@ def process_test_entry_notice(data):
             f"{reason_line}"
         )
 
-        sent = send_line_message(message)
+        sent = send_notification_message(message)
         if sent:
             log("TEST ENTRY NOTICE SENT")
         return sent
@@ -1621,7 +1671,7 @@ def notify_loss_guard_block(data, guard_status):
         f"受信時刻: {now}"
     )
 
-    sent = send_line_message(message)
+    sent = send_notification_message(message)
     if sent:
         log("LOSS GUARD BLOCK NOTICE SENT")
     return sent
@@ -1735,29 +1785,30 @@ def handle_received_signal(data, received_at):
             guard_status = get_loss_guard_status(pair, received_at)
             if not guard_status["allowed"]:
                 log("LOSS GUARD SKIPPED:", guard_status, data)
-                line_sent = notify_loss_guard_block(data, guard_status)
+                notification_sent = notify_loss_guard_block(data, guard_status)
                 return {
                     "status": "blocked",
                     "reason": "loss_guard",
-                    "line_sent": line_sent,
+                    "notification_sent": notification_sent,
+                    "notification_delivery": get_last_notification_delivery_result(),
                     "guard": guard_status
                 }
 
         if is_pre_entry_notice(data):
-            line_sent = process_pre_entry_notice(data)
+            notification_sent = process_pre_entry_notice(data)
             return {
                 "status": "processed",
                 "kind": "pre_entry",
-                "line_sent": line_sent,
-                "line_delivery": get_last_line_delivery_result()
+                "notification_sent": notification_sent,
+                "notification_delivery": get_last_notification_delivery_result()
             }
 
-        line_sent = process_signal(data)
+        notification_sent = process_signal(data)
         return {
             "status": "processed",
             "kind": "entry",
-            "line_sent": line_sent,
-            "line_delivery": get_last_line_delivery_result()
+            "notification_sent": notification_sent,
+            "notification_delivery": get_last_notification_delivery_result()
         }
 
     except Exception as e:
@@ -1779,12 +1830,12 @@ def health():
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "line_config": line_config_status(),
-        "line_delivery_warnings": line_delivery_warnings(),
-        "line_api_retry": line_api_retry_config_status(),
-        "line_quota": get_line_quota_status(),
-        "line_target_cache": get_line_target_cache_status(),
-        "line_webhook_config": get_line_webhook_config_status(),
+        "notification_channel": "discord",
+        "notification_config": discord_config_status(),
+        "notification_delivery_warnings": discord_delivery_warnings(),
+        "notification_delivery": get_last_notification_delivery_result(),
+        "discord_config": discord_config_status(),
+        "discord_api_retry": discord_api_retry_config_status(),
         "loss_guard": risk_guard_config_status(),
         "google_sheets_retry": google_api_retry_config_status(),
         "theoption_hours": theoption_hours_status("USDJPY"),
@@ -1797,38 +1848,50 @@ def health():
 
 @app.route("/line-test", methods=["POST"])
 def line_test():
-    test_secret = os.getenv("LINE_TEST_SECRET")
+    test_secret = os.getenv("DISCORD_TEST_SECRET") or os.getenv("LINE_TEST_SECRET")
     if not test_secret:
         return {
             "status": "disabled",
-            "reason": "LINE_TEST_SECRET is not set",
-            "line_config": line_config_status(),
-            "line_delivery_warnings": line_delivery_warnings()
+            "reason": "DISCORD_TEST_SECRET is not set",
+            "notification_channel": "discord",
+            "notification_config": discord_config_status(),
+            "notification_delivery_warnings": discord_delivery_warnings()
         }, 404
 
-    provided_secret = request.headers.get("X-Line-Test-Secret") or request.args.get("secret")
+    provided_secret = (
+        request.headers.get("X-Discord-Test-Secret")
+        or request.headers.get("X-Line-Test-Secret")
+        or request.args.get("secret")
+    )
     if provided_secret != test_secret:
         return {"status": "forbidden"}, 403
 
     data = request.get_json(silent=True) or {}
     message = str(data.get("message", "")).strip() or (
-        "LINE test from BO Signal Bot\n"
+        "Discord test from BO Signal Bot\n"
         f"version: {APP_VERSION}\n"
         f"time: {datetime.now(JST).strftime('%Y/%m/%d %H:%M:%S')}"
     )
 
-    if send_line_message(message):
+    if send_notification_message(message):
         return {
             "status": "sent",
-            "line_config": line_config_status(),
-            "line_delivery": get_last_line_delivery_result()
+            "notification_channel": "discord",
+            "notification_config": discord_config_status(),
+            "notification_delivery": get_last_notification_delivery_result()
         }, 200
 
     return {
         "status": "error",
-        "line_config": line_config_status(),
-        "line_delivery": get_last_line_delivery_result()
+        "notification_channel": "discord",
+        "notification_config": discord_config_status(),
+        "notification_delivery": get_last_notification_delivery_result()
     }, 500
+
+
+@app.route("/discord-test", methods=["POST"])
+def discord_test():
+    return line_test()
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1857,7 +1920,8 @@ def webhook():
                 "status": "accepted",
                 "message": "LINE webhook processed.",
                 "result": result,
-                "line_config": line_config_status()
+                "notification_channel": "discord",
+                "notification_config": discord_config_status()
             }, 200
 
         if not is_bo_signal_payload(data):
@@ -1871,12 +1935,12 @@ def webhook():
 
         if is_test_payload(data):
             if not is_pre_entry_notice(data):
-                line_sent = process_test_entry_notice(data)
+                notification_sent = process_test_entry_notice(data)
                 result = {
                     "status": "processed",
                     "kind": "entry_test",
-                    "line_sent": line_sent,
-                    "line_delivery": get_last_line_delivery_result()
+                    "notification_sent": notification_sent,
+                    "notification_delivery": get_last_notification_delivery_result()
                 }
             else:
                 result = handle_received_signal(data, received_at)
