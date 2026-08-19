@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "discord only v19 notification channel"
+APP_VERSION = "discord only v20 guaranteed pre-entry cancel"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -61,6 +61,8 @@ DISCORD_API_RETRY_ATTEMPTS = env_int("DISCORD_API_RETRY_ATTEMPTS", 3, minimum=1)
 DISCORD_API_RETRY_BASE_SECONDS = env_int("DISCORD_API_RETRY_BASE_SECONDS", 2, minimum=1)
 DISCORD_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
 DISCORD_CONTENT_LIMIT = 1900
+PRE_ENTRY_AUTO_CANCEL_ENABLED = env_bool("PRE_ENTRY_AUTO_CANCEL_ENABLED", True)
+PRE_ENTRY_AUTO_CANCEL_SECONDS = env_int("PRE_ENTRY_AUTO_CANCEL_SECONDS", 70, minimum=60)
 LINE_API_RETRY_ATTEMPTS = env_int("LINE_API_RETRY_ATTEMPTS", 3, minimum=1)
 LINE_API_RETRY_BASE_SECONDS = env_int("LINE_API_RETRY_BASE_SECONDS", 2, minimum=1)
 LINE_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
@@ -146,6 +148,8 @@ LINE_TARGET_HEADERS = [
 
 recent_signal_keys = {}
 recent_signal_lock = threading.Lock()
+pending_pre_entries = {}
+pending_pre_entries_lock = threading.Lock()
 last_line_delivery_result = {}
 last_line_delivery_lock = threading.Lock()
 line_target_cache = {
@@ -1503,16 +1507,110 @@ def get_notice_type(data):
     return notice
 
 
-def is_pre_entry_notice(data):
+def is_pre_entry_start_notice(data):
     return get_notice_type(data) in (
         "PRE_ENTRY",
         "PRE",
-        "ENTRY_PREVIEW",
+        "ENTRY_PREVIEW"
+    )
+
+
+def is_pre_entry_terminal_notice(data):
+    return get_notice_type(data) in (
         "PRE_ENTRY_CANCEL",
         "PRE_ENTRY_NO_ENTRY",
         "PRE_ENTRY_NO_ENTRY_1MIN",
         "PRE_ENTRY_PENDING"
     )
+
+
+def is_pre_entry_notice(data):
+    return is_pre_entry_start_notice(data) or is_pre_entry_terminal_notice(data)
+
+
+def build_pre_entry_pending_key(data):
+    signal = str(data.get("signal", "UNKNOWN")).strip().upper()
+    pair = normalize_pair(data.get("pair", "USDJPY"))
+    timeframe = duplicate_key_value(data.get("timeframe", "1"), "1")
+    return pair, timeframe, signal
+
+
+def start_pre_entry_auto_cancel(data, received_at):
+    if not PRE_ENTRY_AUTO_CANCEL_ENABLED:
+        return None
+
+    key = build_pre_entry_pending_key(data)
+    state_id = f"{received_at.timestamp()}:{time.monotonic()}"
+    deadline_ts = time.time() + PRE_ENTRY_AUTO_CANCEL_SECONDS
+    data_snapshot = dict(data)
+
+    with pending_pre_entries_lock:
+        pending_pre_entries[key] = {
+            "state_id": state_id,
+            "data": data_snapshot,
+            "created_at": received_at.strftime("%Y/%m/%d %H:%M:%S"),
+            "deadline_ts": deadline_ts
+        }
+
+    timer = threading.Timer(
+        PRE_ENTRY_AUTO_CANCEL_SECONDS,
+        auto_cancel_pre_entry_if_still_pending,
+        args=[key, state_id]
+    )
+    timer.daemon = True
+    timer.start()
+    log(
+        "PRE ENTRY AUTO CANCEL SCHEDULED:",
+        key,
+        f"seconds={PRE_ENTRY_AUTO_CANCEL_SECONDS}"
+    )
+    return state_id
+
+
+def mark_pre_entry_finished(data, status):
+    key = build_pre_entry_pending_key(data)
+    with pending_pre_entries_lock:
+        removed = pending_pre_entries.pop(key, None)
+    if removed:
+        log("PRE ENTRY AUTO CANCEL CLEARED:", key, f"status={status}")
+        return True
+    return False
+
+
+def auto_cancel_pre_entry_if_still_pending(key, state_id):
+    with pending_pre_entries_lock:
+        state = pending_pre_entries.get(key)
+        if not state or state.get("state_id") != state_id:
+            return
+        pending_pre_entries.pop(key, None)
+
+    data = dict(state.get("data") or {})
+    data["notice"] = "PRE_ENTRY_CANCEL"
+    data["reason"] = "server_auto_no_entry_after_1min"
+    log("PRE ENTRY AUTO CANCEL FIRED:", key, data)
+    process_pre_entry_notice(data)
+
+
+def pre_entry_auto_cancel_status():
+    now_ts = time.time()
+    with pending_pre_entries_lock:
+        pending = []
+        for key, state in pending_pre_entries.items():
+            pair, timeframe, signal = key
+            pending.append({
+                "pair": pair,
+                "timeframe": timeframe,
+                "signal": signal,
+                "created_at": state.get("created_at"),
+                "seconds_until_cancel": max(0, int(state.get("deadline_ts", now_ts) - now_ts))
+            })
+
+    return {
+        "enabled": PRE_ENTRY_AUTO_CANCEL_ENABLED,
+        "seconds": PRE_ENTRY_AUTO_CANCEL_SECONDS,
+        "pending_count": len(pending),
+        "pending": pending[:10]
+    }
 
 
 def process_pre_entry_notice(data):
@@ -1533,22 +1631,17 @@ def process_pre_entry_notice(data):
             "no_entry_after_1m_bar_close": "1分足確定時にエントリーなし",
             "no_entry_after_next_bar_fallback": "1分足確定通知を取りこぼしたため次の足で中止",
             "no_entry_after_1m_timeout": "予告から1分経過後にエントリーなし",
-            "no_final_status_after_1min": "予告から1分経過後も最終判定なし"
+            "no_final_status_after_1min": "予告から1分経過後も最終判定なし",
+            "server_auto_no_entry_after_1min": "サーバー側で予告から約1分後まで即エントリー未受信"
         }
         reason_text = reason_labels.get(reason, reason)
         now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
 
-        if notice in ("PRE_ENTRY_CANCEL", "PRE_ENTRY_NO_ENTRY", "PRE_ENTRY_NO_ENTRY_1MIN"):
+        if notice in ("PRE_ENTRY_CANCEL", "PRE_ENTRY_NO_ENTRY", "PRE_ENTRY_NO_ENTRY_1MIN", "PRE_ENTRY_PENDING"):
             title = "⚪【エントリー中止】"
             body = (
                 "予告から約1分後に確定エントリーが出ませんでした。\n"
                 "今回はエントリー見送りです。"
-            )
-        elif notice in ("PRE_ENTRY_PENDING",):
-            title = "🟠【エントリー予告 保留】"
-            body = (
-                "予告から1分を過ぎましたが、確定エントリー/取消を確認できません。\n"
-                "TradingView側の状態を確認してください。"
             )
         else:
             title = "🟡【エントリー予告】"
@@ -1795,14 +1888,21 @@ def handle_received_signal(data, received_at):
                 }
 
         if is_pre_entry_notice(data):
+            if is_pre_entry_terminal_notice(data):
+                mark_pre_entry_finished(data, get_notice_type(data).lower())
             notification_sent = process_pre_entry_notice(data)
+            auto_cancel_state_id = None
+            if is_pre_entry_start_notice(data) and not is_test_payload(data):
+                auto_cancel_state_id = start_pre_entry_auto_cancel(data, received_at)
             return {
                 "status": "processed",
                 "kind": "pre_entry",
                 "notification_sent": notification_sent,
-                "notification_delivery": get_last_notification_delivery_result()
+                "notification_delivery": get_last_notification_delivery_result(),
+                "pre_entry_auto_cancel_state_id": auto_cancel_state_id
             }
 
+        mark_pre_entry_finished(data, "entry")
         notification_sent = process_signal(data)
         return {
             "status": "processed",
@@ -1836,6 +1936,7 @@ def health():
         "notification_delivery": get_last_notification_delivery_result(),
         "discord_config": discord_config_status(),
         "discord_api_retry": discord_api_retry_config_status(),
+        "pre_entry_auto_cancel": pre_entry_auto_cancel_status(),
         "loss_guard": risk_guard_config_status(),
         "google_sheets_retry": google_api_retry_config_status(),
         "theoption_hours": theoption_hours_status("USDJPY"),
