@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v15 line error diagnostics"
+APP_VERSION = "immediate entry v16 quota guard auto target"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -41,6 +41,7 @@ def env_int(name, default, minimum=None):
 JUDGE_DELAY_SECONDS = 300
 HISTORY_SHEET_NAME = "履歴"
 SUMMARY_SHEET_NAME = "日別集計"
+LINE_TARGETS_SHEET_NAME = "LINE通知先"
 DUPLICATE_WINDOW_SECONDS = 120
 LOSS_GUARD_ENABLED = False
 LOSS_GUARD_DAILY_LOSSES = env_int("LOSS_GUARD_DAILY_LOSSES", 2, minimum=1)
@@ -52,6 +53,12 @@ GOOGLE_API_RETRY_BASE_SECONDS = env_int("GOOGLE_API_RETRY_BASE_SECONDS", 2, mini
 LINE_API_RETRY_ATTEMPTS = env_int("LINE_API_RETRY_ATTEMPTS", 3, minimum=1)
 LINE_API_RETRY_BASE_SECONDS = env_int("LINE_API_RETRY_BASE_SECONDS", 2, minimum=1)
 LINE_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
+LINE_AUTO_TARGET_ENABLED = env_bool("LINE_AUTO_TARGET_ENABLED", True)
+LINE_AUTO_TARGET_LIMIT = env_int("LINE_AUTO_TARGET_LIMIT", 1, minimum=1)
+LINE_TARGET_CACHE_SECONDS = env_int("LINE_TARGET_CACHE_SECONDS", 300, minimum=30)
+LINE_BROADCAST_FALLBACK_ENABLED = env_bool("LINE_BROADCAST_FALLBACK_ENABLED", False)
+LINE_QUOTA_GUARD_ENABLED = env_bool("LINE_QUOTA_GUARD_ENABLED", True)
+LINE_QUOTA_CACHE_SECONDS = env_int("LINE_QUOTA_CACHE_SECONDS", 300, minimum=30)
 THEOPTION_HOURS_FILTER_ENABLED = os.getenv(
     "THEOPTION_HOURS_FILTER_ENABLED",
     "true"
@@ -112,10 +119,30 @@ SUMMARY_HEADERS = [
     "勝率"
 ]
 
+LINE_TARGET_HEADERS = [
+    "登録日時",
+    "種別",
+    "ID",
+    "表示名",
+    "最終イベント"
+]
+
 recent_signal_keys = {}
 recent_signal_lock = threading.Lock()
 last_line_delivery_result = {}
 last_line_delivery_lock = threading.Lock()
+line_target_cache = {
+    "expires_at": 0,
+    "targets": [],
+    "source": "none",
+    "error": None
+}
+line_target_cache_lock = threading.Lock()
+line_quota_cache = {
+    "expires_at": 0,
+    "status": None
+}
+line_quota_cache_lock = threading.Lock()
 
 
 def log(message, *values):
@@ -215,7 +242,7 @@ def get_line_access_token():
     )
 
 
-def get_line_targets():
+def get_configured_line_targets():
     line_to = (
         os.getenv("LINE_TO")
         or os.getenv("LINE_USER_ID")
@@ -228,19 +255,70 @@ def get_line_targets():
     return [target.strip() for target in line_to.split(",") if target.strip()]
 
 
+def get_line_targets():
+    return get_line_targets_with_source()[0]
+
+
+def get_line_targets_with_source():
+    configured_targets = get_configured_line_targets()
+    if configured_targets:
+        return configured_targets, "env"
+
+    if not LINE_AUTO_TARGET_ENABLED:
+        return [], "none"
+
+    now_ts = time.time()
+    with line_target_cache_lock:
+        if line_target_cache["expires_at"] > now_ts:
+            return list(line_target_cache["targets"]), line_target_cache["source"]
+
+    targets, source, error = load_auto_line_targets()
+    limited_targets = targets[:LINE_AUTO_TARGET_LIMIT]
+
+    with line_target_cache_lock:
+        line_target_cache.update({
+            "expires_at": now_ts + LINE_TARGET_CACHE_SECONDS,
+            "targets": limited_targets,
+            "source": source,
+            "error": error
+        })
+
+    return limited_targets, source
+
+
+def get_line_target_cache_status():
+    with line_target_cache_lock:
+        return {
+            "source": line_target_cache["source"],
+            "error": line_target_cache["error"],
+            "cache_expires_at": line_target_cache["expires_at"]
+        }
+
+
 def line_config_status():
     token_exists = bool(get_line_access_token())
-    targets = get_line_targets()
+    targets, target_source = get_line_targets_with_source()
+    has_targets = bool(targets)
+    if len(targets) == 1:
+        delivery_mode = "push"
+    elif len(targets) > 1:
+        delivery_mode = "multicast"
+    elif token_exists and LINE_BROADCAST_FALLBACK_ENABLED:
+        delivery_mode = "broadcast"
+    elif token_exists:
+        delivery_mode = "no_target"
+    else:
+        delivery_mode = "not_configured"
+
     return {
         "line_token": token_exists,
-        "line_to": bool(targets),
+        "line_to": has_targets,
         "line_target_count": len(targets),
-        "delivery_mode": (
-            "push" if len(targets) == 1
-            else "multicast" if len(targets) > 1
-            else "broadcast" if token_exists
-            else "not_configured"
-        )
+        "line_target_source": target_source,
+        "auto_target_enabled": LINE_AUTO_TARGET_ENABLED,
+        "broadcast_fallback_enabled": LINE_BROADCAST_FALLBACK_ENABLED,
+        "quota_guard_enabled": LINE_QUOTA_GUARD_ENABLED,
+        "delivery_mode": delivery_mode
     }
 
 
@@ -248,9 +326,14 @@ def line_delivery_warnings():
     config = line_config_status()
     warnings = []
     if config["delivery_mode"] == "broadcast":
-        warnings.append("LINE_TO is not set; sending by broadcast")
+        warnings.append("LINE_TO is not set; sending by broadcast fallback")
+    if config["delivery_mode"] == "no_target":
+        warnings.append("LINE target is not set; broadcast fallback is disabled")
     if not config["line_token"]:
         warnings.append("LINE access token is not set")
+    quota_status = get_line_quota_status()
+    if quota_status.get("exhausted"):
+        warnings.append("LINE monthly message quota is exhausted")
     return warnings
 
 
@@ -263,6 +346,91 @@ def set_last_line_delivery_result(result):
 def get_last_line_delivery_result():
     with last_line_delivery_lock:
         return dict(last_line_delivery_result)
+
+
+def get_line_quota_status(force=False):
+    if not LINE_QUOTA_GUARD_ENABLED and not force:
+        return {"enabled": False}
+
+    token = get_line_access_token()
+    if not token:
+        return {
+            "enabled": LINE_QUOTA_GUARD_ENABLED,
+            "available": False,
+            "reason": "LINE access token is not set"
+        }
+
+    now_ts = time.time()
+    with line_quota_cache_lock:
+        cached_status = line_quota_cache["status"]
+        if not force and cached_status is not None and line_quota_cache["expires_at"] > now_ts:
+            return dict(cached_status)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    status = {
+        "enabled": LINE_QUOTA_GUARD_ENABLED,
+        "available": False,
+        "exhausted": False,
+        "quota": None,
+        "consumption": None,
+        "reason": ""
+    }
+
+    try:
+        quota_response = requests.get(
+            "https://api.line.me/v2/bot/message/quota",
+            headers=headers,
+            timeout=10
+        )
+        consumption_response = requests.get(
+            "https://api.line.me/v2/bot/message/quota/consumption",
+            headers=headers,
+            timeout=10
+        )
+        status["quota_status_code"] = quota_response.status_code
+        status["consumption_status_code"] = consumption_response.status_code
+
+        if quota_response.status_code >= 400 or consumption_response.status_code >= 400:
+            status["reason"] = (
+                f"quota={quota_response.status_code} "
+                f"consumption={consumption_response.status_code}"
+            )
+        else:
+            quota_data = quota_response.json()
+            consumption_data = consumption_response.json()
+            quota_type = quota_data.get("type")
+            quota_value = quota_data.get("value")
+            total_usage = (
+                consumption_data.get("totalUsage")
+                if "totalUsage" in consumption_data
+                else consumption_data.get("total_usage")
+            )
+
+            status.update({
+                "available": True,
+                "quota": {
+                    "type": quota_type,
+                    "value": quota_value
+                },
+                "consumption": {
+                    "total_usage": total_usage
+                }
+            })
+
+            if quota_type == "limited" and quota_value is not None and total_usage is not None:
+                status["remaining"] = max(0, int(quota_value) - int(total_usage))
+                status["exhausted"] = int(total_usage) >= int(quota_value)
+
+    except Exception as e:
+        status["reason"] = f"{type(e).__name__}: {e}"
+
+    with line_quota_cache_lock:
+        line_quota_cache.update({
+            "expires_at": now_ts + LINE_QUOTA_CACHE_SECONDS,
+            "status": status
+        })
+
+    return dict(status)
 
 
 def get_theoption_session_window(current_dt, start_hour=THEOPTION_START_HOUR, end_hour=THEOPTION_END_HOUR):
@@ -364,22 +532,46 @@ def send_line_message(message):
         if not line_access_token:
             raise RuntimeError("LINE access token is not set")
 
+        quota_status = get_line_quota_status()
+        if LINE_QUOTA_GUARD_ENABLED and quota_status.get("exhausted"):
+            set_last_line_delivery_result({
+                "ok": False,
+                "delivery_mode": line_config_status()["delivery_mode"],
+                "error": "LINE monthly message quota is exhausted",
+                "quota": quota_status
+            })
+            log("LINE QUOTA EXHAUSTED:", quota_status)
+            return False
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {line_access_token}"
         }
         messages = [{"type": "text", "text": message}]
-        targets = get_line_targets()
+        targets, target_source = get_line_targets_with_source()
 
         if len(targets) == 1:
             url = "https://api.line.me/v2/bot/message/push"
             payload = {"to": targets[0], "messages": messages}
+            delivery_mode = "push"
         elif len(targets) > 1:
             url = "https://api.line.me/v2/bot/message/multicast"
             payload = {"to": targets, "messages": messages}
+            delivery_mode = "multicast"
         else:
+            if not LINE_BROADCAST_FALLBACK_ENABLED:
+                set_last_line_delivery_result({
+                    "ok": False,
+                    "delivery_mode": "no_target",
+                    "target_source": target_source,
+                    "error": "LINE target is not set and broadcast fallback is disabled"
+                })
+                log("LINE TARGET MISSING: broadcast fallback disabled")
+                return False
+
             url = "https://api.line.me/v2/bot/message/broadcast"
             payload = {"messages": messages}
+            delivery_mode = "broadcast"
 
         for attempt in range(1, LINE_API_RETRY_ATTEMPTS + 1):
             try:
@@ -393,7 +585,8 @@ def send_line_message(message):
                         "ok": True,
                         "status_code": response.status_code,
                         "attempt": attempt,
-                        "delivery_mode": line_config_status()["delivery_mode"],
+                        "delivery_mode": delivery_mode,
+                        "target_source": target_source,
                         "response": response.text[:500]
                     })
                     return True
@@ -403,7 +596,8 @@ def send_line_message(message):
                     "ok": False,
                     "status_code": response.status_code,
                     "attempt": attempt,
-                    "delivery_mode": line_config_status()["delivery_mode"],
+                    "delivery_mode": delivery_mode,
+                    "target_source": target_source,
                     "response": response.text[:500],
                     "will_retry": response.status_code in LINE_API_RETRY_STATUSES
                 })
@@ -413,7 +607,8 @@ def send_line_message(message):
                 set_last_line_delivery_result({
                     "ok": False,
                     "attempt": attempt,
-                    "delivery_mode": line_config_status()["delivery_mode"],
+                    "delivery_mode": delivery_mode,
+                    "target_source": target_source,
                     "error": f"{type(e).__name__}: {e}",
                     "will_retry": True
                 })
@@ -602,6 +797,124 @@ def ensure_headers(worksheet, headers):
 
 def get_history_sheet():
     return get_or_create_worksheet(HISTORY_SHEET_NAME, HISTORY_HEADERS)
+
+
+def get_line_targets_sheet():
+    return get_or_create_worksheet(LINE_TARGETS_SHEET_NAME, LINE_TARGET_HEADERS)
+
+
+def invalidate_line_target_cache():
+    with line_target_cache_lock:
+        line_target_cache.update({
+            "expires_at": 0,
+            "targets": [],
+            "source": "none",
+            "error": None
+        })
+
+
+def load_saved_line_targets():
+    try:
+        sheet = get_line_targets_sheet()
+        rows = retry_google_operation(
+            "READ LINE TARGETS",
+            sheet.get_all_values
+        )
+
+        seen = set()
+        targets = []
+        for row in reversed(rows[1:]):
+            if len(row) < 3:
+                continue
+            target_id = str(row[2] or "").strip()
+            if not target_id or target_id in seen:
+                continue
+            seen.add(target_id)
+            targets.append(target_id)
+
+        return targets, None
+
+    except Exception as e:
+        log_error("LINE TARGETS READ", e)
+        return [], f"{type(e).__name__}: {e}"
+
+
+def fetch_line_follower_targets():
+    token = get_line_access_token()
+    if not token:
+        return [], "LINE access token is not set"
+
+    try:
+        response = requests.get(
+            "https://api.line.me/v2/bot/followers/ids",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"limit": 300},
+            timeout=10
+        )
+        if response.status_code >= 400:
+            return [], f"LINE followers API {response.status_code}: {response.text[:300]}"
+
+        data = response.json()
+        user_ids = [
+            str(user_id).strip()
+            for user_id in data.get("userIds", [])
+            if str(user_id).strip()
+        ]
+        return user_ids, None
+
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
+def load_auto_line_targets():
+    saved_targets, saved_error = load_saved_line_targets()
+    if saved_targets:
+        return saved_targets, "sheet", saved_error
+
+    follower_targets, follower_error = fetch_line_follower_targets()
+    if follower_targets:
+        return follower_targets, "followers_api", follower_error
+
+    return [], "none", saved_error or follower_error
+
+
+def save_line_target(target_type, target_id, display_name="", event_type=""):
+    target_id = str(target_id or "").strip()
+    if not target_id:
+        return False
+
+    try:
+        sheet = get_line_targets_sheet()
+        rows = retry_google_operation(
+            "READ LINE TARGETS BEFORE SAVE",
+            sheet.get_all_values
+        )
+        existing_ids = {
+            str(row[2] or "").strip()
+            for row in rows[1:]
+            if len(row) >= 3
+        }
+        if target_id in existing_ids:
+            return False
+
+        now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+        row = [
+            now,
+            str(target_type or "").strip(),
+            target_id,
+            str(display_name or "").strip(),
+            str(event_type or "").strip()
+        ]
+        retry_google_operation(
+            "APPEND LINE TARGET",
+            lambda: sheet.append_row(row, value_input_option="USER_ENTERED")
+        )
+        invalidate_line_target_cache()
+        return True
+
+    except Exception as e:
+        log_error("LINE TARGET SAVE", e)
+        return False
 
 
 def extract_date(value):
@@ -1210,6 +1523,57 @@ def is_duplicate_signal(data, received_at):
         return False
 
 
+def is_line_webhook_payload(data):
+    return isinstance(data.get("events"), list)
+
+
+def extract_line_target_from_event(event):
+    source = event.get("source") or {}
+    source_type = str(source.get("type", "")).strip()
+
+    if source_type == "user":
+        return source_type, source.get("userId")
+    if source_type == "group":
+        return source_type, source.get("groupId")
+    if source_type == "room":
+        return source_type, source.get("roomId")
+
+    return source_type, None
+
+
+def handle_line_webhook_payload(data):
+    events = data.get("events") or []
+    saved_count = 0
+    seen_count = 0
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        target_type, target_id = extract_line_target_from_event(event)
+        if not target_id:
+            continue
+        seen_count += 1
+        if save_line_target(
+            target_type=target_type,
+            target_id=target_id,
+            event_type=event.get("type", "")
+        ):
+            saved_count += 1
+
+    return {
+        "status": "processed",
+        "kind": "line_webhook",
+        "events": len(events),
+        "targets_seen": seen_count,
+        "targets_saved": saved_count
+    }
+
+
+def is_bo_signal_payload(data):
+    signal = str(data.get("signal", "")).strip().upper()
+    return signal in ("HIGH", "LOW")
+
+
 def handle_received_signal(data, received_at):
     try:
         pair = data.get("pair", "USDJPY")
@@ -1280,6 +1644,8 @@ def health():
         "line_config": line_config_status(),
         "line_delivery_warnings": line_delivery_warnings(),
         "line_api_retry": line_api_retry_config_status(),
+        "line_quota": get_line_quota_status(),
+        "line_target_cache": get_line_target_cache_status(),
         "loss_guard": risk_guard_config_status(),
         "google_sheets_retry": google_api_retry_config_status(),
         "theoption_hours": theoption_hours_status("USDJPY"),
@@ -1315,12 +1681,14 @@ def line_test():
     if send_line_message(message):
         return {
             "status": "sent",
-            "line_config": line_config_status()
+            "line_config": line_config_status(),
+            "line_delivery": get_last_line_delivery_result()
         }, 200
 
     return {
         "status": "error",
-        "line_config": line_config_status()
+        "line_config": line_config_status(),
+        "line_delivery": get_last_line_delivery_result()
     }, 500
 
 
@@ -1342,6 +1710,23 @@ def webhook():
             }, 200
 
         received_at = datetime.now(JST)
+
+        if is_line_webhook_payload(data):
+            log("RECEIVED LINE WEBHOOK:", {"events": len(data.get("events") or [])})
+            result = handle_line_webhook_payload(data)
+            return {
+                "status": "accepted",
+                "message": "LINE webhook processed.",
+                "result": result,
+                "line_config": line_config_status()
+            }, 200
+
+        if not is_bo_signal_payload(data):
+            log("NON SIGNAL PAYLOAD SKIPPED:", data)
+            return {
+                "status": "accepted",
+                "message": "Non-signal payload skipped."
+            }, 200
 
         log("RECEIVED:", data)
 
