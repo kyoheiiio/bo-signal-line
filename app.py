@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v13 line retry duplicate fix"
+APP_VERSION = "immediate entry v14 line test diagnostics"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -973,7 +973,8 @@ def process_signal(data):
             f"{sheet_note}"
         )
 
-        if send_line_message(message):
+        sent = send_line_message(message)
+        if sent:
             log("ENTRY NOTICE SENT")
 
         timer = threading.Timer(
@@ -983,10 +984,12 @@ def process_signal(data):
         )
         timer.daemon = True
         timer.start()
+        return sent
 
     except Exception as e:
         log_error("SIGNAL PROCESS", e)
         notify_error("シグナル処理エラー", e)
+        return False
 
 
 def get_notice_type(data):
@@ -1061,12 +1064,15 @@ def process_pre_entry_notice(data):
             f"{reason_line}"
         )
 
-        if send_line_message(message):
+        sent = send_line_message(message)
+        if sent:
             log("PRE ENTRY NOTICE SENT")
+        return sent
 
     except Exception as e:
         log_error("PRE ENTRY NOTICE", e)
         notify_error("エントリー予告処理エラー", e)
+        return False
 
 
 def is_test_payload(data):
@@ -1122,8 +1128,10 @@ def notify_loss_guard_block(data, guard_status):
         f"受信時刻: {now}"
     )
 
-    if send_line_message(message):
+    sent = send_line_message(message)
+    if sent:
         log("LOSS GUARD BLOCK NOTICE SENT")
+    return sent
 
 
 def build_duplicate_key(data, received_at):
@@ -1166,28 +1174,53 @@ def handle_received_signal(data, received_at):
         hours_status = theoption_hours_status(pair, received_at)
         if not hours_status["allowed"]:
             log("THEOPTION HOURS SKIPPED:", hours_status, data)
-            return
+            return {
+                "status": "skipped",
+                "reason": "theoption_hours",
+                "hours": hours_status
+            }
 
         if is_duplicate_signal(data, received_at):
             log("DUPLICATE SIGNAL SKIPPED:", data)
-            return
+            return {
+                "status": "skipped",
+                "reason": "duplicate"
+            }
 
         if should_apply_loss_guard(data):
             guard_status = get_loss_guard_status(pair, received_at)
             if not guard_status["allowed"]:
                 log("LOSS GUARD SKIPPED:", guard_status, data)
-                notify_loss_guard_block(data, guard_status)
-                return
+                line_sent = notify_loss_guard_block(data, guard_status)
+                return {
+                    "status": "blocked",
+                    "reason": "loss_guard",
+                    "line_sent": line_sent,
+                    "guard": guard_status
+                }
 
         if is_pre_entry_notice(data):
-            process_pre_entry_notice(data)
-            return
+            line_sent = process_pre_entry_notice(data)
+            return {
+                "status": "processed",
+                "kind": "pre_entry",
+                "line_sent": line_sent
+            }
 
-        process_signal(data)
+        line_sent = process_signal(data)
+        return {
+            "status": "processed",
+            "kind": "entry",
+            "line_sent": line_sent
+        }
 
     except Exception as e:
         log_error("WEBHOOK WORKER", e)
         notify_error("Webhookバックグラウンド処理エラー", e)
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 
 @app.route("/")
@@ -1267,6 +1300,14 @@ def webhook():
         received_at = datetime.now(JST)
 
         log("RECEIVED:", data)
+
+        if is_test_payload(data) and is_pre_entry_notice(data):
+            result = handle_received_signal(data, received_at)
+            return {
+                "status": "processed",
+                "message": "TEST webhook processed synchronously.",
+                "result": result
+            }, 200
 
         worker = threading.Thread(
             target=handle_received_signal,
