@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v16 quota guard auto target"
+APP_VERSION = "immediate entry v17 auto line webhook setup"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -59,6 +59,12 @@ LINE_TARGET_CACHE_SECONDS = env_int("LINE_TARGET_CACHE_SECONDS", 300, minimum=30
 LINE_BROADCAST_FALLBACK_ENABLED = env_bool("LINE_BROADCAST_FALLBACK_ENABLED", False)
 LINE_QUOTA_GUARD_ENABLED = env_bool("LINE_QUOTA_GUARD_ENABLED", True)
 LINE_QUOTA_CACHE_SECONDS = env_int("LINE_QUOTA_CACHE_SECONDS", 300, minimum=30)
+LINE_AUTO_CONFIGURE_WEBHOOK = env_bool("LINE_AUTO_CONFIGURE_WEBHOOK", True)
+LINE_WEBHOOK_ENDPOINT_URL = os.getenv(
+    "LINE_WEBHOOK_ENDPOINT_URL",
+    "https://bo-signal-line.onrender.com/webhook"
+).strip()
+LINE_WEBHOOK_CONFIG_CACHE_SECONDS = env_int("LINE_WEBHOOK_CONFIG_CACHE_SECONDS", 3600, minimum=60)
 THEOPTION_HOURS_FILTER_ENABLED = os.getenv(
     "THEOPTION_HOURS_FILTER_ENABLED",
     "true"
@@ -143,6 +149,11 @@ line_quota_cache = {
     "status": None
 }
 line_quota_cache_lock = threading.Lock()
+line_webhook_config_cache = {
+    "expires_at": 0,
+    "status": None
+}
+line_webhook_config_lock = threading.Lock()
 
 
 def log(message, *values):
@@ -334,6 +345,12 @@ def line_delivery_warnings():
     quota_status = get_line_quota_status()
     if quota_status.get("exhausted"):
         warnings.append("LINE monthly message quota is exhausted")
+    webhook_config = get_line_webhook_config_status()
+    if webhook_config.get("available"):
+        if webhook_config.get("endpoint") != LINE_WEBHOOK_ENDPOINT_URL:
+            warnings.append("LINE webhook endpoint is not configured for this app")
+        if webhook_config.get("active") is False:
+            warnings.append("LINE webhook is not active")
     return warnings
 
 
@@ -427,6 +444,90 @@ def get_line_quota_status(force=False):
     with line_quota_cache_lock:
         line_quota_cache.update({
             "expires_at": now_ts + LINE_QUOTA_CACHE_SECONDS,
+            "status": status
+        })
+
+    return dict(status)
+
+
+def get_line_webhook_config_status(force=False):
+    token = get_line_access_token()
+    if not token:
+        return {
+            "enabled": LINE_AUTO_CONFIGURE_WEBHOOK,
+            "available": False,
+            "reason": "LINE access token is not set"
+        }
+
+    now_ts = time.time()
+    with line_webhook_config_lock:
+        cached_status = line_webhook_config_cache["status"]
+        if not force and cached_status is not None and line_webhook_config_cache["expires_at"] > now_ts:
+            return dict(cached_status)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    status = {
+        "enabled": LINE_AUTO_CONFIGURE_WEBHOOK,
+        "available": False,
+        "desired_endpoint": LINE_WEBHOOK_ENDPOINT_URL,
+        "endpoint": None,
+        "active": None,
+        "updated": False,
+        "reason": ""
+    }
+
+    try:
+        get_response = requests.get(
+            "https://api.line.me/v2/bot/channel/webhook/endpoint",
+            headers=headers,
+            timeout=10
+        )
+        status["get_status_code"] = get_response.status_code
+
+        if get_response.status_code >= 400:
+            status["reason"] = f"get webhook endpoint {get_response.status_code}: {get_response.text[:300]}"
+        else:
+            data = get_response.json()
+            current_endpoint = str(data.get("endpoint", "") or "").strip()
+            status.update({
+                "available": True,
+                "endpoint": current_endpoint or None,
+                "active": data.get("active")
+            })
+
+            if (
+                LINE_AUTO_CONFIGURE_WEBHOOK
+                and LINE_WEBHOOK_ENDPOINT_URL
+                and current_endpoint != LINE_WEBHOOK_ENDPOINT_URL
+            ):
+                put_response = requests.put(
+                    "https://api.line.me/v2/bot/channel/webhook/endpoint",
+                    headers=headers,
+                    json={"endpoint": LINE_WEBHOOK_ENDPOINT_URL},
+                    timeout=10
+                )
+                status["put_status_code"] = put_response.status_code
+                if put_response.status_code >= 400:
+                    status["reason"] = (
+                        f"set webhook endpoint {put_response.status_code}: "
+                        f"{put_response.text[:300]}"
+                    )
+                else:
+                    status.update({
+                        "endpoint": LINE_WEBHOOK_ENDPOINT_URL,
+                        "updated": True,
+                        "reason": "webhook endpoint updated"
+                    })
+
+    except Exception as e:
+        status["reason"] = f"{type(e).__name__}: {e}"
+
+    with line_webhook_config_lock:
+        line_webhook_config_cache.update({
+            "expires_at": now_ts + LINE_WEBHOOK_CONFIG_CACHE_SECONDS,
             "status": status
         })
 
@@ -1646,6 +1747,7 @@ def health():
         "line_api_retry": line_api_retry_config_status(),
         "line_quota": get_line_quota_status(),
         "line_target_cache": get_line_target_cache_status(),
+        "line_webhook_config": get_line_webhook_config_status(),
         "loss_guard": risk_guard_config_status(),
         "google_sheets_retry": google_api_retry_config_status(),
         "theoption_hours": theoption_hours_status("USDJPY"),
