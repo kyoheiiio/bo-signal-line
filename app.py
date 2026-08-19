@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v12 no loss guard"
+APP_VERSION = "immediate entry v13 line retry duplicate fix"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -49,6 +49,9 @@ LOSS_GUARD_LOOKBACK_LOSSES = env_int("LOSS_GUARD_LOOKBACK_LOSSES", 2, minimum=1)
 LOSS_GUARD_COOLDOWN_HOURS = env_int("LOSS_GUARD_COOLDOWN_HOURS", 6, minimum=1)
 GOOGLE_API_RETRY_ATTEMPTS = env_int("GOOGLE_API_RETRY_ATTEMPTS", 3, minimum=1)
 GOOGLE_API_RETRY_BASE_SECONDS = env_int("GOOGLE_API_RETRY_BASE_SECONDS", 2, minimum=1)
+LINE_API_RETRY_ATTEMPTS = env_int("LINE_API_RETRY_ATTEMPTS", 3, minimum=1)
+LINE_API_RETRY_BASE_SECONDS = env_int("LINE_API_RETRY_BASE_SECONDS", 2, minimum=1)
+LINE_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
 THEOPTION_HOURS_FILTER_ENABLED = os.getenv(
     "THEOPTION_HOURS_FILTER_ENABLED",
     "true"
@@ -129,6 +132,14 @@ def google_api_retry_config_status():
         "attempts": GOOGLE_API_RETRY_ATTEMPTS,
         "base_seconds": GOOGLE_API_RETRY_BASE_SECONDS,
         "retry_statuses": [429, 500, 502, 503, 504]
+    }
+
+
+def line_api_retry_config_status():
+    return {
+        "attempts": LINE_API_RETRY_ATTEMPTS,
+        "base_seconds": LINE_API_RETRY_BASE_SECONDS,
+        "retry_statuses": list(LINE_API_RETRY_STATUSES)
     }
 
 
@@ -229,6 +240,16 @@ def line_config_status():
             else "not_configured"
         )
     }
+
+
+def line_delivery_warnings():
+    config = line_config_status()
+    warnings = []
+    if config["delivery_mode"] == "broadcast":
+        warnings.append("LINE_TO is not set; sending by broadcast")
+    if not config["line_token"]:
+        warnings.append("LINE access token is not set")
+    return warnings
 
 
 def get_theoption_session_window(current_dt, start_hour=THEOPTION_START_HOUR, end_hour=THEOPTION_END_HOUR):
@@ -347,15 +368,35 @@ def send_line_message(message):
             url = "https://api.line.me/v2/bot/message/broadcast"
             payload = {"messages": messages}
 
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        for attempt in range(1, LINE_API_RETRY_ATTEMPTS + 1):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=10)
 
-        log("LINE STATUS:", response.status_code)
-        log("LINE RESPONSE:", response.text)
+                log("LINE STATUS:", response.status_code, f"attempt={attempt}")
+                log("LINE RESPONSE:", response.text)
 
-        if response.status_code >= 400:
-            raise RuntimeError(f"LINE API error {response.status_code}: {response.text}")
+                if response.status_code < 400:
+                    return True
 
-        return True
+                error = RuntimeError(f"LINE API error {response.status_code}: {response.text}")
+                should_retry = response.status_code in LINE_API_RETRY_STATUSES
+            except requests.RequestException as e:
+                error = e
+                should_retry = True
+
+            if not should_retry or attempt >= LINE_API_RETRY_ATTEMPTS:
+                raise error
+
+            wait_seconds = LINE_API_RETRY_BASE_SECONDS * attempt
+            log(
+                "LINE RETRY:",
+                f"attempt={attempt}",
+                f"wait={wait_seconds}s",
+                f"error={error}"
+            )
+            time.sleep(wait_seconds)
+
+        return False
 
     except Exception as e:
         log_error("LINE SEND", e)
@@ -799,7 +840,7 @@ def format_price(price, pair="USDJPY"):
 
 def format_optional_price(price, pair="USDJPY"):
     text = str(price or "").strip()
-    if not text:
+    if not text or is_tradingview_placeholder(text):
         return "N/A"
 
     try:
@@ -1039,6 +1080,18 @@ def is_test_payload(data):
     return "TEST" in text or "テスト" in text
 
 
+def is_tradingview_placeholder(value):
+    text = str(value or "").strip()
+    return text.startswith("{{") and text.endswith("}}")
+
+
+def duplicate_key_value(value, fallback=""):
+    text = str(value or "").strip()
+    if not text or is_tradingview_placeholder(text):
+        return fallback
+    return text
+
+
 def should_apply_loss_guard(data):
     return False
 
@@ -1074,16 +1127,15 @@ def notify_loss_guard_block(data, guard_status):
 
 
 def build_duplicate_key(data, received_at):
-    alert_time = str(data.get("alert_time", "")).strip()
-    received_second = received_at.strftime("%Y/%m/%d %H:%M:%S")
-    signal_time = alert_time or received_second
+    received_minute = received_at.strftime("%Y/%m/%d %H:%M")
+    signal_time = duplicate_key_value(data.get("alert_time", ""), received_minute)
 
     return (
         str(data.get("notice", data.get("type", ""))).strip().upper(),
         str(data.get("signal", "")).strip().upper(),
         str(data.get("pair", "")).strip(),
-        str(data.get("timeframe", "")).strip(),
-        str(data.get("signal_price", "")).strip(),
+        duplicate_key_value(data.get("timeframe", "")),
+        duplicate_key_value(data.get("signal_price", "")),
         signal_time
     )
 
@@ -1149,6 +1201,8 @@ def health():
         "status": "ok",
         "version": APP_VERSION,
         "line_config": line_config_status(),
+        "line_delivery_warnings": line_delivery_warnings(),
+        "line_api_retry": line_api_retry_config_status(),
         "loss_guard": risk_guard_config_status(),
         "google_sheets_retry": google_api_retry_config_status(),
         "theoption_hours": theoption_hours_status("USDJPY"),
@@ -1163,7 +1217,12 @@ def health():
 def line_test():
     test_secret = os.getenv("LINE_TEST_SECRET")
     if not test_secret:
-        return {"status": "disabled"}, 404
+        return {
+            "status": "disabled",
+            "reason": "LINE_TEST_SECRET is not set",
+            "line_config": line_config_status(),
+            "line_delivery_warnings": line_delivery_warnings()
+        }, 404
 
     provided_secret = request.headers.get("X-Line-Test-Secret") or request.args.get("secret")
     if provided_secret != test_secret:
