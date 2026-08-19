@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v14 line test diagnostics"
+APP_VERSION = "immediate entry v15 line error diagnostics"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -114,6 +114,8 @@ SUMMARY_HEADERS = [
 
 recent_signal_keys = {}
 recent_signal_lock = threading.Lock()
+last_line_delivery_result = {}
+last_line_delivery_lock = threading.Lock()
 
 
 def log(message, *values):
@@ -252,6 +254,17 @@ def line_delivery_warnings():
     return warnings
 
 
+def set_last_line_delivery_result(result):
+    with last_line_delivery_lock:
+        last_line_delivery_result.clear()
+        last_line_delivery_result.update(result)
+
+
+def get_last_line_delivery_result():
+    with last_line_delivery_lock:
+        return dict(last_line_delivery_result)
+
+
 def get_theoption_session_window(current_dt, start_hour=THEOPTION_START_HOUR, end_hour=THEOPTION_END_HOUR):
     if current_dt.tzinfo is None:
         current_dt = current_dt.replace(tzinfo=JST)
@@ -376,12 +389,34 @@ def send_line_message(message):
                 log("LINE RESPONSE:", response.text)
 
                 if response.status_code < 400:
+                    set_last_line_delivery_result({
+                        "ok": True,
+                        "status_code": response.status_code,
+                        "attempt": attempt,
+                        "delivery_mode": line_config_status()["delivery_mode"],
+                        "response": response.text[:500]
+                    })
                     return True
 
                 error = RuntimeError(f"LINE API error {response.status_code}: {response.text}")
+                set_last_line_delivery_result({
+                    "ok": False,
+                    "status_code": response.status_code,
+                    "attempt": attempt,
+                    "delivery_mode": line_config_status()["delivery_mode"],
+                    "response": response.text[:500],
+                    "will_retry": response.status_code in LINE_API_RETRY_STATUSES
+                })
                 should_retry = response.status_code in LINE_API_RETRY_STATUSES
             except requests.RequestException as e:
                 error = e
+                set_last_line_delivery_result({
+                    "ok": False,
+                    "attempt": attempt,
+                    "delivery_mode": line_config_status()["delivery_mode"],
+                    "error": f"{type(e).__name__}: {e}",
+                    "will_retry": True
+                })
                 should_retry = True
 
             if not should_retry or attempt >= LINE_API_RETRY_ATTEMPTS:
@@ -399,6 +434,13 @@ def send_line_message(message):
         return False
 
     except Exception as e:
+        current_result = get_last_line_delivery_result()
+        current_result.update({
+            "ok": False,
+            "delivery_mode": line_config_status()["delivery_mode"],
+            "error": f"{type(e).__name__}: {e}"
+        })
+        set_last_line_delivery_result(current_result)
         log_error("LINE SEND", e)
         return False
 
@@ -1204,14 +1246,16 @@ def handle_received_signal(data, received_at):
             return {
                 "status": "processed",
                 "kind": "pre_entry",
-                "line_sent": line_sent
+                "line_sent": line_sent,
+                "line_delivery": get_last_line_delivery_result()
             }
 
         line_sent = process_signal(data)
         return {
             "status": "processed",
             "kind": "entry",
-            "line_sent": line_sent
+            "line_sent": line_sent,
+            "line_delivery": get_last_line_delivery_result()
         }
 
     except Exception as e:
