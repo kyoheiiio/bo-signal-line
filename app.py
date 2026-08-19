@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "immediate entry v17 auto line webhook setup"
+APP_VERSION = "immediate entry v18 safe entry test diagnostics"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -1542,6 +1542,43 @@ def is_test_payload(data):
     return "TEST" in text or "テスト" in text
 
 
+def process_test_entry_notice(data):
+    try:
+        log("TEST ENTRY NOTICE START:", data)
+
+        signal = str(data.get("signal", "UNKNOWN")).strip().upper()
+        pair = display_pair(data.get("pair", "USDJPY"))
+        timeframe = str(data.get("timeframe", "1")).strip()
+        signal_price = str(data.get("signal_price", "")).strip()
+        signal_price_text = format_optional_price(signal_price, pair)
+        alert_time = str(data.get("alert_time", "")).strip()
+        reason = str(data.get("reason", "")).strip()
+        now = datetime.now(JST).strftime("%Y/%m/%d %H:%M:%S")
+
+        reason_line = f"\n理由: {reason}" if reason else ""
+        message = (
+            "🔴【即エントリー通知 テスト】\n\n"
+            "通知経路のテストです。実エントリー・履歴記録・5分後判定は行いません。\n\n"
+            f"通貨: {pair}\n"
+            f"足種: {timeframe}\n"
+            f"方向: {signal}\n"
+            f"シグナル時価格: {signal_price_text}\n"
+            f"TradingView時刻: {alert_time or 'N/A'}\n"
+            f"受信時刻: {now}"
+            f"{reason_line}"
+        )
+
+        sent = send_line_message(message)
+        if sent:
+            log("TEST ENTRY NOTICE SENT")
+        return sent
+
+    except Exception as e:
+        log_error("TEST ENTRY NOTICE", e)
+        notify_error("即エントリーテスト処理エラー", e)
+        return False
+
+
 def is_tradingview_placeholder(value):
     text = str(value or "").strip()
     return text.startswith("{{") and text.endswith("}}")
@@ -1832,8 +1869,17 @@ def webhook():
 
         log("RECEIVED:", data)
 
-        if is_test_payload(data) and is_pre_entry_notice(data):
-            result = handle_received_signal(data, received_at)
+        if is_test_payload(data):
+            if not is_pre_entry_notice(data):
+                line_sent = process_test_entry_notice(data)
+                result = {
+                    "status": "processed",
+                    "kind": "entry_test",
+                    "line_sent": line_sent,
+                    "line_delivery": get_last_line_delivery_result()
+                }
+            else:
+                result = handle_received_signal(data, received_at)
             return {
                 "status": "processed",
                 "message": "TEST webhook processed synchronously.",
