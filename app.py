@@ -13,13 +13,29 @@ from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
-APP_VERSION = "discord only v20 guaranteed pre-entry cancel"
+APP_VERSION = "discord only v21 notification time"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 
 JST = ZoneInfo("Asia/Tokyo")
+
+
+def notification_time_text(now=None):
+    current = now or datetime.now(JST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=JST)
+    return current.astimezone(JST).strftime("%Y/%m/%d %H:%M:%S JST")
+
+
+def append_notification_time(message):
+    text = str(message or "").rstrip()
+    if "通知時刻:" in text:
+        return text
+    if not text:
+        return f"通知時刻: {notification_time_text()}"
+    return f"{text}\n通知時刻: {notification_time_text()}"
 
 
 def env_bool(name, default):
@@ -788,7 +804,7 @@ def send_discord_message(message):
 
 
 def send_notification_message(message):
-    return send_discord_message(message)
+    return send_discord_message(append_notification_time(message))
 
 
 def send_line_message(message):
