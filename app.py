@@ -10,10 +10,11 @@ from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from signal_protocol import ReferenceSignals
 
 app = Flask(__name__)
 
-APP_VERSION = "discord only v21 notification time"
+APP_VERSION = "discord v22 confirmed reference validation"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -78,7 +79,7 @@ DISCORD_API_RETRY_BASE_SECONDS = env_int("DISCORD_API_RETRY_BASE_SECONDS", 2, mi
 DISCORD_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
 DISCORD_CONTENT_LIMIT = 1900
 PRE_ENTRY_AUTO_CANCEL_ENABLED = env_bool("PRE_ENTRY_AUTO_CANCEL_ENABLED", True)
-PRE_ENTRY_AUTO_CANCEL_SECONDS = env_int("PRE_ENTRY_AUTO_CANCEL_SECONDS", 70, minimum=60)
+PRE_ENTRY_AUTO_CANCEL_SECONDS = 60
 LINE_API_RETRY_ATTEMPTS = env_int("LINE_API_RETRY_ATTEMPTS", 3, minimum=1)
 LINE_API_RETRY_BASE_SECONDS = env_int("LINE_API_RETRY_BASE_SECONDS", 2, minimum=1)
 LINE_API_RETRY_STATUSES = (429, 500, 502, 503, 504)
@@ -708,7 +709,7 @@ def discord_retry_after_seconds(response, attempt):
     return DISCORD_API_RETRY_BASE_SECONDS * attempt
 
 
-def send_discord_message(message):
+def send_discord_message(message, deadline_ts=None):
     delivery_mode = "discord_webhook"
     try:
         if not DISCORD_WEBHOOK_URL:
@@ -731,23 +732,29 @@ def send_discord_message(message):
             payload["avatar_url"] = DISCORD_AVATAR_URL
 
         for attempt in range(1, DISCORD_API_RETRY_ATTEMPTS + 1):
+            remaining = None if deadline_ts is None else deadline_ts - time.time()
+            if remaining is not None and remaining <= 0:
+                set_last_notification_delivery_result({"ok": False, "channel": "discord", "error": "delivery_deadline_expired"})
+                return False
             response = None
             try:
-                response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+                timeout = 10 if remaining is None else (min(1, remaining / 2), max(0.001, remaining / 2))
+                response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=timeout)
 
                 log("DISCORD STATUS:", response.status_code, f"attempt={attempt}")
                 log("DISCORD RESPONSE:", response.text[:500])
 
                 if response.status_code < 400:
+                    timely = deadline_ts is None or time.time() < deadline_ts
                     set_last_notification_delivery_result({
-                        "ok": True,
+                        "ok": timely,
                         "channel": "discord",
                         "status_code": response.status_code,
                         "attempt": attempt,
                         "delivery_mode": delivery_mode,
                         "response": response.text[:500]
                     })
-                    return True
+                    return timely
 
                 error = RuntimeError(f"Discord webhook error {response.status_code}: {response.text}")
                 should_retry = response.status_code in DISCORD_API_RETRY_STATUSES
@@ -780,6 +787,8 @@ def send_discord_message(message):
                 if response is not None
                 else DISCORD_API_RETRY_BASE_SECONDS * attempt
             )
+            if deadline_ts is not None and time.time() + wait_seconds >= deadline_ts:
+                return False
             log(
                 "DISCORD RETRY:",
                 f"attempt={attempt}",
@@ -803,8 +812,8 @@ def send_discord_message(message):
         return False
 
 
-def send_notification_message(message):
-    return send_discord_message(append_notification_time(message))
+def send_notification_message(message, deadline_ts=None):
+    return send_discord_message(append_notification_time(message), deadline_ts=deadline_ts)
 
 
 def send_line_message(message):
@@ -1871,7 +1880,41 @@ def is_bo_signal_payload(data):
     return signal in ("HIGH", "LOW")
 
 
+reference_engine = None
+reference_engine_lock = threading.Lock()
+reference_archive_lock = threading.Lock()
+
+
+def archive_reference_events(events):
+    # Separate append-only records; never update the legacy actual-looking history.
+    headers = ["audit_id", "event_id", "recorded_at", "pair", "direction", "status",
+               "entry_time_ms", "signal_price", "result_price", "reference_result",
+               "actual_result", "source", "notification_sent", "delay_seconds", "details"]
+    with reference_archive_lock:
+        sheet = get_or_create_worksheet("参考シグナルV22", headers)
+        rows = [[event.get(key, "") for key in
+                 ("audit_id", "event_id", "recorded_at", "pair", "signal", "status",
+                  "entry_time_ms", "signal_price", "result_price", "reference_result",
+                  "actual_result", "ticker", "notification_sent", "delay_seconds")]
+                + [json.dumps(event, ensure_ascii=False)] for event in events]
+        retry_google_operation("APPEND REFERENCE AUDIT", lambda: sheet.append_rows(rows, value_input_option="RAW"))
+
+
+def get_reference_engine():
+    global reference_engine
+    with reference_engine_lock:
+        if reference_engine is None:
+            reference_engine = ReferenceSignals(
+                os.getenv("SIGNAL_STATE_PATH", "instance/reference_signals.sqlite3"),
+                send_notification_message, archive_reference_events)
+            reference_engine.start()
+        return reference_engine
+
+
 def handle_received_signal(data, received_at):
+    if data.get("schema_version") == 2:
+        allowed = data.get("test") is True or theoption_hours_status(data.get("pair"), received_at)["allowed"]
+        return get_reference_engine().handle(data, allowed=allowed)
     try:
         pair = data.get("pair", "USDJPY")
         hours_status = theoption_hours_status(pair, received_at)
@@ -1906,10 +1949,10 @@ def handle_received_signal(data, received_at):
         if is_pre_entry_notice(data):
             if is_pre_entry_terminal_notice(data):
                 mark_pre_entry_finished(data, get_notice_type(data).lower())
-            notification_sent = process_pre_entry_notice(data)
             auto_cancel_state_id = None
             if is_pre_entry_start_notice(data) and not is_test_payload(data):
                 auto_cancel_state_id = start_pre_entry_auto_cancel(data, received_at)
+            notification_sent = process_pre_entry_notice(data)
             return {
                 "status": "processed",
                 "kind": "pre_entry",
@@ -1918,11 +1961,14 @@ def handle_received_signal(data, received_at):
                 "pre_entry_auto_cancel_state_id": auto_cancel_state_id
             }
 
-        mark_pre_entry_finished(data, "entry")
-        notification_sent = process_signal(data)
+        # Old alerts contain unresolved placeholders and have no verifiable clock.
+        # Fail closed until their TradingView snapshots have been replaced.
+        mark_pre_entry_finished(data, "legacy_rejected")
+        rejected = dict(data, notice="PRE_ENTRY_CANCEL", reason="旧形式の時刻を検証できないため中止。V22対応アラートへ更新が必要です")
+        notification_sent = process_pre_entry_notice(rejected)
         return {
             "status": "processed",
-            "kind": "entry",
+            "kind": "legacy_rejected",
             "notification_sent": notification_sent,
             "notification_delivery": get_last_notification_delivery_result()
         }
@@ -1946,6 +1992,7 @@ def health():
     return {
         "status": "ok",
         "version": APP_VERSION,
+        "reference_protocol": get_reference_engine().status(),
         "notification_channel": "discord",
         "notification_config": discord_config_status(),
         "notification_delivery_warnings": discord_delivery_warnings(),
@@ -2049,6 +2096,9 @@ def webhook():
             }, 200
 
         log("RECEIVED:", data)
+
+        if data.get("schema_version") == 2 and data.get("test") is True:
+            return {"status": "processed", "result": handle_received_signal(data, received_at)}, 200
 
         if is_test_payload(data):
             if not is_pre_entry_notice(data):
