@@ -4,6 +4,7 @@ import os
 import threading
 import json
 import time
+import queue
 import gspread
 from collections import defaultdict
 from gspread.exceptions import APIError, WorksheetNotFound
@@ -14,7 +15,7 @@ from signal_protocol import ReferenceSignals
 
 app = Flask(__name__)
 
-APP_VERSION = "discord v22 confirmed reference validation"
+APP_VERSION = "discord v23 isolated delivery and latency tracing"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -709,6 +710,24 @@ def discord_retry_after_seconds(response, attempt):
     return DISCORD_API_RETRY_BASE_SECONDS * attempt
 
 
+discord_http_sessions = queue.LifoQueue(maxsize=8)
+
+
+def discord_http_post(payload, timeout):
+    try:
+        session = discord_http_sessions.get_nowait()
+    except queue.Empty:
+        session = requests.Session()
+    try:
+        return session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=timeout)
+    finally:
+        session.cookies.clear()
+        try:
+            discord_http_sessions.put_nowait(session)
+        except queue.Full:
+            session.close()
+
+
 def send_discord_message(message, deadline_ts=None):
     delivery_mode = "discord_webhook"
     try:
@@ -739,7 +758,7 @@ def send_discord_message(message, deadline_ts=None):
             response = None
             try:
                 timeout = 10 if remaining is None else (min(1, remaining / 2), max(0.001, remaining / 2))
-                response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=timeout)
+                response = discord_http_post(payload, timeout)
 
                 log("DISCORD STATUS:", response.status_code, f"attempt={attempt}")
                 log("DISCORD RESPONSE:", response.text[:500])
@@ -1914,7 +1933,16 @@ def get_reference_engine():
 def handle_received_signal(data, received_at):
     if data.get("schema_version") == 2:
         allowed = data.get("test") is True or theoption_hours_status(data.get("pair"), received_at)["allowed"]
-        return get_reference_engine().handle(data, allowed=allowed)
+        engine = get_reference_engine()
+        started = time.time()
+        result = engine.handle(data, allowed=allowed, received_at=received_at.timestamp())
+        log("REFERENCE HANDLED:", json.dumps({
+            "event_id": data.get("event_id"), "notice": data.get("notice"),
+            "received_at_ms": round(received_at.timestamp() * 1000),
+            "worker_started_at_ms": round(started * 1000),
+            "worker_finished_at_ms": round(time.time() * 1000), "result": result,
+        }, ensure_ascii=False))
+        return result
     try:
         pair = data.get("pair", "USDJPY")
         hours_status = theoption_hours_status(pair, received_at)
@@ -2060,6 +2088,7 @@ def discord_test():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    received_at = datetime.now(JST)
     try:
         data = request.get_json(silent=True)
         if data is None and request.data:
@@ -2074,8 +2103,6 @@ def webhook():
                 "status": "accepted",
                 "message": "Invalid payload skipped."
             }, 200
-
-        received_at = datetime.now(JST)
 
         if is_line_webhook_payload(data):
             log("RECEIVED LINE WEBHOOK:", {"events": len(data.get("events") or [])})

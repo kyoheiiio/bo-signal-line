@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import fcntl
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -66,7 +67,7 @@ class ReferenceSignals:
     def __init__(self, path, send, archive=None, clock=time.time):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         self.path, self.send, self.archive, self.clock = path, send, archive, clock
-        self.lock = threading.RLock()
+        self.locks = [threading.RLock() for _ in range(1024)]
         self.started_at = clock()
         self.archive_error = None
         self.last_error = None
@@ -85,13 +86,38 @@ class ReferenceSignals:
             db.close()
 
     @contextmanager
-    def serialized(self):
-        with self.lock, open(self.path + ".lock", "a") as lockfile:
-            fcntl.flock(lockfile, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lockfile, fcntl.LOCK_UN)
+    def serialized(self, event_id, blocking=True):
+        # Bounded, process-stable shards avoid one slow delivery blocking all signals.
+        shard = int.from_bytes(hashlib.sha256(event_id.encode()).digest()[:2], "big") % len(self.locks)
+        lock = self.locks[shard]
+        if not lock.acquire(blocking=blocking):
+            yield False
+            return
+        try:
+            with open(f"{self.path}.lock.{shard:03x}", "a") as lockfile:
+                try:
+                    fcntl.flock(lockfile, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+                except BlockingIOError:
+                    yield False
+                    return
+                try:
+                    yield True
+                finally:
+                    fcntl.flock(lockfile, fcntl.LOCK_UN)
+        finally:
+            lock.release()
+
+    def deliver(self, data, message, deadline_ts=None):
+        timing = data.setdefault("server_timing", {})
+        started = self.clock()
+        timing["send_started_at_ms"] = round(started * 1000)
+        timing["emission_to_send_seconds"] = round(started - data["emitted_ms"] / 1000, 3)
+        try:
+            return self.send(message, deadline_ts=deadline_ts)
+        finally:
+            finished = self.clock()
+            timing["send_finished_at_ms"] = round(finished * 1000)
+            timing["discord_request_seconds"] = round(finished - started, 3)
 
     def load(self, event_id):
         with self.db() as db:
@@ -114,10 +140,15 @@ class ReferenceSignals:
 
     def message(self, data, title, body):
         test = " テスト" if data.get("test") is True else " 検証用"
+        received = data.get("server_timing", {}).get("received_at_ms")
+        timing_text = f"発信時刻: {stamp(data['emitted_ms'] / 1000)}\n"
+        if received is not None:
+            timing_text += f"受信時刻: {stamp(received / 1000)}\n"
         return (f"【{title}{test}】\n{body}\n\n"
                 f"通貨: {data['pair']} / {data['signal']}\n"
                 f"参考価格: {data['signal_price']} ({data['ticker']})\n"
                 f"基準時刻: {stamp(data['entry_time_ms'] / 1000)}\n"
+                f"{timing_text}"
                 f"ID: {data['event_id']}\n実約定・実勝敗とは異なります。")
 
     def cancel(self, data, reason):
@@ -131,23 +162,36 @@ class ReferenceSignals:
 
     def deliver_cancel(self, data):
         reason = data["cancel_reason"]
-        sent = self.send(self.message(data, "エントリー中止", f"今回は見送りです。\n理由: {reason}"))
+        sent = self.deliver(data, self.message(data, "エントリー中止", f"今回は見送りです。\n理由: {reason}"))
         self.save(data, "CANCELLED" if sent else "CANCEL_PENDING", 0 if sent else self.clock() + 30)
         self.record(data, "CANCELLED", notification_sent=sent, reason=reason)
         return {"status": "cancelled", "notification_sent": sent, "reason": reason}
 
-    def handle(self, raw, allowed=True):
+    def handle(self, raw, allowed=True, received_at=None):
+        started = self.clock()
+        received_at = started if received_at is None else received_at
         try:
             data = validate(raw)
+            if not math.isfinite(received_at) or received_at > started + 1:
+                raise ValueError("invalid_server_received_at")
         except (ValueError, KeyError, TypeError, OverflowError) as error:
             return {"status": "rejected", "reason": str(error)}
-        with self.serialized():
+        with self.serialized(data["event_id"]):
             now = self.clock()
             notice = data["notice"]
             state = self.load(data["event_id"])
             emitted = data["emitted_ms"] / 1000
             entry = data["entry_time_ms"] / 1000
             preview = data["preview_started_ms"] / 1000
+            # Ignore client-supplied timing fields; only the trusted route timestamp is used.
+            data["server_timing"] = {
+                "received_at_ms": round(received_at * 1000),
+                "worker_started_at_ms": round(started * 1000),
+                "processing_started_at_ms": round(now * 1000),
+                "upstream_seconds": round(received_at - emitted, 3),
+                "worker_queue_seconds": round(max(0, started - received_at), 3),
+                "state_lock_wait_seconds": round(max(0, now - started), 3),
+            }
             if emitted > now + 1 or now - emitted > 86400:
                 return {"status": "rejected", "reason": "invalid_event_clock"}
             if notice == "PRE_ENTRY_CANCEL":
@@ -169,7 +213,7 @@ class ReferenceSignals:
                 if now >= deadline or now - emitted > MAX_ENTRY_AGE:
                     return self.cancel(data, "予告が遅れて到着したため中止")
                 self.save(data, "PENDING", deadline)
-                sent = self.send(self.message(data, "エントリー予告", "未確定です。予告発生から60秒を期限として中止します。通信状況により通知が遅れる場合があります。"),
+                sent = self.deliver(data, self.message(data, "エントリー予告", "未確定です。予告発生から60秒を期限として中止します。通信状況により通知が遅れる場合があります。"),
                                  deadline_ts=min(emitted + MAX_ENTRY_AGE, deadline))
                 self.record(data, "PRE_ENTRY", notification_sent=sent)
                 if not sent:
@@ -187,7 +231,7 @@ class ReferenceSignals:
                 return self.cancel(data, "5秒の配信期限、または予告60秒の期限を超過")
             # SENDING is fail-closed if the worker dies during an ambiguous HTTP request.
             self.save(data, "SENDING", deadline)
-            sent = self.send(self.message(data, "確定エントリー",
+            sent = self.deliver(data, self.message(data, "確定エントリー",
                             f"5分判定の参考シグナルです。\n判定基準時刻: {stamp(entry + EXPIRY_SECONDS)}\n"
                             f"通知有効期限: {stamp(deadline)}\n期限を過ぎた場合は見送ってください。"), deadline_ts=deadline)
             if not sent:
@@ -207,25 +251,31 @@ class ReferenceSignals:
         delta = data["result_price"] - original["signal_price"]
         outcome = "DRAW" if delta == 0 else "WIN" if (delta > 0) == (data["signal"] == "HIGH") else "LOSE"
         self.save(data, "RESULT")
-        sent = self.send(self.message(data, "5分参考判定", f"参考結果: {outcome}\n判定参考価格: {data['result_price']}\n"
+        sent = self.deliver(data, self.message(data, "5分参考判定", f"参考結果: {outcome}\n判定参考価格: {data['result_price']}\n"
                                      f"判定基準時刻: {stamp(expected / 1000)}"))
         self.record(data, "REFERENCE_RESULT", reference_result=outcome, notification_sent=sent)
         return {"status": "result", "reference_result": outcome, "notification_sent": sent}
 
     def sweep(self):
-        with self.serialized():
-            with self.db() as db:
-                rows = db.execute("SELECT * FROM signals WHERE state IN ('PENDING', 'SENDING', 'ENTERED', 'CANCEL_PENDING') AND deadline<=?",
-                                  (self.clock(),)).fetchall()
-            for row in rows:
-                data = json.loads(row["data"])
+        active_states = ("PENDING", "SENDING", "ENTERED", "CANCEL_PENDING")
+        with self.db() as db:
+            rows = db.execute("SELECT id FROM signals WHERE state IN ('PENDING', 'SENDING', 'ENTERED', 'CANCEL_PENDING') AND deadline<=?",
+                              (self.clock(),)).fetchall()
+        for item in rows:
+            with self.serialized(item["id"], blocking=False) as acquired:
+                if not acquired:
+                    continue
+                row = self.load(item["id"])
+                if not row or row["state"] not in active_states or row["deadline"] > self.clock():
+                    continue
+                data = row["data"]
                 if row["state"] == "CANCEL_PENDING":
                     self.deliver_cancel(data)
                 elif row["state"] in ("PENDING", "SENDING"):
                     self.cancel(data, "予告から60秒以内に確定通知が成立しませんでした")
                 else:
                     self.save(data, "UNKNOWN_RESULT")
-                    sent = self.send(self.message(data, "参考判定未取得", "5分後の同一配信元の価格を確認できません。勝敗集計から除外します。"))
+                    sent = self.deliver(data, self.message(data, "参考判定未取得", "5分後の同一配信元の価格を確認できません。勝敗集計から除外します。"))
                     self.record(data, "UNKNOWN_RESULT", notification_sent=sent)
 
     def export_once(self):
@@ -267,8 +317,11 @@ class ReferenceSignals:
         with self.db() as db:
             counts = dict(db.execute("SELECT state, COUNT(*) FROM signals GROUP BY state").fetchall())
             backlog = db.execute("SELECT COUNT(*) FROM audit WHERE exported=0").fetchone()[0]
+            last = db.execute("SELECT data FROM audit ORDER BY created DESC LIMIT 1").fetchone()
         return {"schema_version": 2, "mode": "reference_validation", "max_entry_age_seconds": MAX_ENTRY_AGE,
                 "pre_entry_cancel_seconds": PREVIEW_SECONDS, "expiry_seconds": EXPIRY_SECONDS,
                 "states": counts, "archive_backlog": backlog, "archive_error": self.archive_error,
                 "worker_error": self.last_error, "actual_results": "unavailable",
+                "serialization": "event_shards_1024", "latency_instrumentation": True,
+                "last_server_timing": json.loads(last["data"]).get("server_timing") if last else None,
                 "state_storage": "local SQLite; not durable across Render redeploys"}

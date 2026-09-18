@@ -16,7 +16,7 @@ if barstate.isfirst and (timeframe.in_seconds() != 60 or syminfo.ticker != "USDJ
 adxThreshold = input.int(24, "ADX下限", minval=18, maxval=25, group=grpCore)
 cooldownBars = input.int(3, "連続エントリー防止バー数", minval=1, maxval=5, group=grpCore)
 breakLen = input.int(10, "ブレイク期間", minval=8, maxval=15, group=grpCore)
-bbWidthMin = input.float(0.0003, "BB幅フィルター", step=0.0001, group=grpCore)
+bbWidthMin = input.float(0.0002, "BB幅フィルター", step=0.0001, group=grpCore)
 maxEmaDistance = input.float(0.0015, "EMA乖離上限", step=0.0001, group=grpCore)
 useH1Filter = input.bool(true, "1時間足フィルターを使う", group=grpCore)
 highRsiMin = input.int(53, "HIGH RSI下限", minval=45, maxval=65, group=grpCore)
