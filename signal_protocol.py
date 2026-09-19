@@ -139,17 +139,24 @@ class ReferenceSignals:
                        (audit["audit_id"], self.clock(), json.dumps(audit)))
 
     def message(self, data, title, body):
-        test = " テスト" if data.get("test") is True else " 検証用"
+        is_test = data.get("test") is True or str(data.get("ticker", "")).startswith("TEST:")
+        prefix = "【テスト・注文禁止】" if is_test else ""
+        pair = "USD/JPY" if data["pair"] == "USDJPY" else "BTC/USD"
+        direction = "上" if data["signal"] == "HIGH" else "下"
+        price = f"{data['signal_price']:.3f}" if data["pair"] == "USDJPY" else f"{data['signal_price']:.2f}"
+        time_label = "エントリー予定" if title == "エントリー予告" else "エントリー基準"
         received = data.get("server_timing", {}).get("received_at_ms")
         timing_text = f"発信時刻: {stamp(data['emitted_ms'] / 1000)}\n"
         if received is not None:
             timing_text += f"受信時刻: {stamp(received / 1000)}\n"
-        return (f"【{title}{test}】\n{body}\n\n"
-                f"通貨: {data['pair']} / {data['signal']}\n"
-                f"参考価格: {data['signal_price']} ({data['ticker']})\n"
-                f"基準時刻: {stamp(data['entry_time_ms'] / 1000)}\n"
+        return (f"{prefix}【{title}】{pair} {data['signal']}（{direction}）/ 5分\n"
+                f"{body}\n"
+                f"{time_label}: {stamp(data['entry_time_ms'] / 1000)}\n"
+                f"参考価格: {price} ({data['ticker']})\n\n"
+                f"通知時刻: {stamp(self.clock())}（サーバー作成）\n"
                 f"{timing_text}"
-                f"ID: {data['event_id']}\n実約定・実勝敗とは異なります。")
+                f"ID: {data['event_id']}\n"
+                "自動発注は行いません。参考判定は実約定・実勝敗とは異なります。")
 
     def cancel(self, data, reason):
         previous = self.load(data["event_id"])
@@ -162,7 +169,7 @@ class ReferenceSignals:
 
     def deliver_cancel(self, data):
         reason = data["cancel_reason"]
-        sent = self.deliver(data, self.message(data, "エントリー中止", f"今回は見送りです。\n理由: {reason}"))
+        sent = self.deliver(data, self.message(data, "エントリー中止", f"エントリーしないでください。\n理由: {reason}"))
         self.save(data, "CANCELLED" if sent else "CANCEL_PENDING", 0 if sent else self.clock() + 30)
         self.record(data, "CANCELLED", notification_sent=sent, reason=reason)
         return {"status": "cancelled", "notification_sent": sent, "reason": reason}
@@ -195,6 +202,9 @@ class ReferenceSignals:
             if emitted > now + 1 or now - emitted > 86400:
                 return {"status": "rejected", "reason": "invalid_event_clock"}
             if notice == "PRE_ENTRY_CANCEL":
+                # Existing previews must still close outside session hours.
+                if not allowed and not state:
+                    return {"status": "blocked", "reason": "session_without_preview"}
                 return self.cancel(data, "予告後に確定条件が成立しない、または60秒の期限切れ")
             if notice == "REFERENCE_RESULT":
                 return self.result(data, state)
@@ -213,7 +223,10 @@ class ReferenceSignals:
                 if now >= deadline or now - emitted > MAX_ENTRY_AGE:
                     return self.cancel(data, "予告が遅れて到着したため中止")
                 self.save(data, "PENDING", deadline)
-                sent = self.deliver(data, self.message(data, "エントリー予告", "未確定です。予告発生から60秒を期限として中止します。通信状況により通知が遅れる場合があります。"),
+                sent = self.deliver(data, self.message(data, "エントリー予告",
+                                     "待機。確定通知が届くまではエントリーしないでください。\n"
+                                     f"確定待ち期限: {stamp(deadline)}\n"
+                                     "予告は必ず60秒前ではありません。未確定のままなら予告開始60秒で中止。"),
                                  deadline_ts=min(emitted + MAX_ENTRY_AGE, deadline))
                 self.record(data, "PRE_ENTRY", notification_sent=sent)
                 if not sent:
@@ -232,8 +245,10 @@ class ReferenceSignals:
             # SENDING is fail-closed if the worker dies during an ambiguous HTTP request.
             self.save(data, "SENDING", deadline)
             sent = self.deliver(data, self.message(data, "確定エントリー",
-                            f"5分判定の参考シグナルです。\n判定基準時刻: {stamp(entry + EXPIRY_SECONDS)}\n"
-                            f"通知有効期限: {stamp(deadline)}\n期限を過ぎた場合は見送ってください。"), deadline_ts=deadline)
+                            "期限内のみ手動エントリー。期限切れは見送り。\n"
+                            f"通知有効期限: {stamp(deadline)}（この時刻以後は入らない）\n"
+                            f"5分判定基準: {stamp(entry + EXPIRY_SECONDS)}\n"
+                            "業者の受付価格・判定時刻を必ず確認してください。"), deadline_ts=deadline)
             if not sent:
                 return self.cancel(data, "期限内の配信を確認できませんでした。エントリーしないでください")
             self.save(data, "ENTERED", entry + EXPIRY_SECONDS + RESULT_GRACE_SECONDS)
@@ -285,7 +300,9 @@ class ReferenceSignals:
             rows = db.execute("SELECT * FROM audit WHERE exported=0 ORDER BY created LIMIT 50").fetchall()
         if not rows:
             return
-        events = [json.loads(row["data"]) for row in rows if not json.loads(row["data"]).get("test")]
+        decoded = [json.loads(row["data"]) for row in rows]
+        events = [data for data in decoded if not data.get("test")
+                  and not str(data.get("ticker", "")).startswith("TEST:")]
         if events:
             self.archive(events)
         with self.db() as db:
@@ -323,5 +340,6 @@ class ReferenceSignals:
                 "states": counts, "archive_backlog": backlog, "archive_error": self.archive_error,
                 "worker_error": self.last_error, "actual_results": "unavailable",
                 "serialization": "event_shards_1024", "latency_instrumentation": True,
+                "message_format": "live_manual_v1", "notification_time_basis": "server_message_created",
                 "last_server_timing": json.loads(last["data"]).get("server_timing") if last else None,
                 "state_storage": "local SQLite; not durable across Render redeploys"}

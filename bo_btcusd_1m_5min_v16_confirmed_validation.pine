@@ -134,7 +134,10 @@ alertMinute = minute(time_close, "Asia/Tokyo")
 alertDay = dayofweek(time_close, "Asia/Tokyo")
 cryptoTradingHours = alertHour >= 8 or alertHour < 5
 cryptoJudgeBeforeClose = not (alertHour == 4 and alertMinute >= 55)
-cryptoWeekendClock = alertDay == dayofweek.saturday or alertDay == dayofweek.sunday or (alertDay == dayofweek.monday and alertHour < 5)
+// Match the server's session-start day: Saturday 00:00-05:00 is Friday's session.
+cryptoWeekendDaySession = (alertDay == dayofweek.saturday or alertDay == dayofweek.sunday) and alertHour >= 8
+cryptoWeekendOvernightSession = (alertDay == dayofweek.sunday or alertDay == dayofweek.monday) and alertHour < 5
+cryptoWeekendClock = cryptoWeekendDaySession or cryptoWeekendOvernightSession
 theOptionHoursOk = not useTheOptionHours or (cryptoTradingHours and cryptoJudgeBeforeClose)
 weekendOk = not weekendOnly or cryptoWeekendClock
 sessionOk = theOptionHoursOk and weekendOk
