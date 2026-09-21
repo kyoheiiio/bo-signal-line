@@ -140,20 +140,24 @@ class ReferenceSignals:
 
     def message(self, data, title, body):
         is_test = data.get("test") is True or str(data.get("ticker", "")).startswith("TEST:")
-        prefix = "【テスト・注文禁止】" if is_test else ""
+        prefix = "🧪【テスト・注文禁止】\n" if is_test else ""
+        icon = {"エントリー予告": "🔔", "確定エントリー": "✅", "エントリー中止": "⛔",
+                "5分参考判定": "📊", "参考判定未取得": "⚠️"}.get(title, "ℹ️")
         pair = "USD/JPY" if data["pair"] == "USDJPY" else "BTC/USD"
         direction = "上" if data["signal"] == "HIGH" else "下"
+        arrow = "⬆️" if data["signal"] == "HIGH" else "⬇️"
         price = f"{data['signal_price']:.3f}" if data["pair"] == "USDJPY" else f"{data['signal_price']:.2f}"
         time_label = "エントリー予定" if title == "エントリー予告" else "エントリー基準"
         received = data.get("server_timing", {}).get("received_at_ms")
         timing_text = f"発信時刻: {stamp(data['emitted_ms'] / 1000)}\n"
         if received is not None:
             timing_text += f"受信時刻: {stamp(received / 1000)}\n"
-        return (f"{prefix}【{title}】{pair} {data['signal']}（{direction}）/ 5分\n"
-                f"{body}\n"
-                f"{time_label}: {stamp(data['entry_time_ms'] / 1000)}\n"
-                f"参考価格: {price} ({data['ticker']})\n\n"
-                f"通知時刻: {stamp(self.clock())}（サーバー作成）\n"
+        return (f"{prefix}{icon}【{title}】{pair}\n"
+                f"{arrow} {data['signal']}（{direction}）｜5分判定\n\n"
+                f"🕒 {time_label}: {stamp(data['entry_time_ms'] / 1000)}\n"
+                f"{body}\n\n"
+                f"参考価格: {price} ({data['ticker']})\n"
+                f"📨 通知時刻: {stamp(self.clock())}（サーバー作成）\n"
                 f"{timing_text}"
                 f"ID: {data['event_id']}\n"
                 "自動発注は行いません。参考判定は実約定・実勝敗とは異なります。")
@@ -169,7 +173,7 @@ class ReferenceSignals:
 
     def deliver_cancel(self, data):
         reason = data["cancel_reason"]
-        sent = self.deliver(data, self.message(data, "エントリー中止", f"エントリーしないでください。\n理由: {reason}"))
+        sent = self.deliver(data, self.message(data, "エントリー中止", f"⛔ 見送り。エントリーしないでください。\n理由: {reason}"))
         self.save(data, "CANCELLED" if sent else "CANCEL_PENDING", 0 if sent else self.clock() + 30)
         self.record(data, "CANCELLED", notification_sent=sent, reason=reason)
         return {"status": "cancelled", "notification_sent": sent, "reason": reason}
@@ -224,9 +228,9 @@ class ReferenceSignals:
                     return self.cancel(data, "予告が遅れて到着したため中止")
                 self.save(data, "PENDING", deadline)
                 sent = self.deliver(data, self.message(data, "エントリー予告",
-                                     "待機。確定通知が届くまではエントリーしないでください。\n"
-                                     f"確定待ち期限: {stamp(deadline)}\n"
-                                     "予告は必ず60秒前ではありません。未確定のままなら予告開始60秒で中止。"),
+                                     "⏳ 待機。確定通知が届くまではエントリーしないでください。\n"
+                                     f"⌛ 確定待ち期限: {stamp(deadline)}\n"
+                                     "未確定なら予告開始60秒で中止。予告は必ず60秒前ではありません。"),
                                  deadline_ts=min(emitted + MAX_ENTRY_AGE, deadline))
                 self.record(data, "PRE_ENTRY", notification_sent=sent)
                 if not sent:
@@ -245,9 +249,9 @@ class ReferenceSignals:
             # SENDING is fail-closed if the worker dies during an ambiguous HTTP request.
             self.save(data, "SENDING", deadline)
             sent = self.deliver(data, self.message(data, "確定エントリー",
-                            "期限内のみ手動エントリー。期限切れは見送り。\n"
-                            f"通知有効期限: {stamp(deadline)}（この時刻以後は入らない）\n"
-                            f"5分判定基準: {stamp(entry + EXPIRY_SECONDS)}\n"
+                            "👉 期限内のみ手動エントリー。期限切れは見送り。\n"
+                            f"⌛ 通知有効期限: {stamp(deadline)}（この時刻以後は入らない）\n"
+                            f"🏁 5分判定基準: {stamp(entry + EXPIRY_SECONDS)}\n"
                             "業者の受付価格・判定時刻を必ず確認してください。"), deadline_ts=deadline)
             if not sent:
                 return self.cancel(data, "期限内の配信を確認できませんでした。エントリーしないでください")
@@ -340,6 +344,6 @@ class ReferenceSignals:
                 "states": counts, "archive_backlog": backlog, "archive_error": self.archive_error,
                 "worker_error": self.last_error, "actual_results": "unavailable",
                 "serialization": "event_shards_1024", "latency_instrumentation": True,
-                "message_format": "live_manual_v1", "notification_time_basis": "server_message_created",
+                "message_format": "live_manual_emoji_v2", "notification_time_basis": "server_message_created",
                 "last_server_timing": json.loads(last["data"]).get("server_timing") if last else None,
                 "state_storage": "local SQLite; not durable across Render redeploys"}
