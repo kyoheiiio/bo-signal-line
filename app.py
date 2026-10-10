@@ -1,5 +1,6 @@
 from flask import Flask, request
 import requests
+from urllib3.util import Timeout
 import os
 import threading
 import json
@@ -15,7 +16,7 @@ from signal_protocol import ReferenceSignals
 
 app = Flask(__name__)
 
-APP_VERSION = "discord v25 clear emoji notices"
+APP_VERSION = "discord v26 shared delivery budget"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -757,20 +758,25 @@ def send_discord_message(message, deadline_ts=None):
                 return False
             response = None
             try:
-                timeout = 10 if remaining is None else (min(1, remaining / 2), max(0.001, remaining / 2))
+                # Share the remaining deadline between connection and response waits.
+                timeout = 10 if remaining is None else Timeout(
+                    total=remaining, connect=min(1, remaining), read=remaining
+                )
                 response = discord_http_post(payload, timeout)
+                response_received_at = time.time()
 
                 log("DISCORD STATUS:", response.status_code, f"attempt={attempt}")
                 log("DISCORD RESPONSE:", response.text[:500])
 
                 if response.status_code < 400:
-                    timely = deadline_ts is None or time.time() < deadline_ts
+                    timely = deadline_ts is None or response_received_at < deadline_ts
                     set_last_notification_delivery_result({
                         "ok": timely,
                         "channel": "discord",
                         "status_code": response.status_code,
                         "attempt": attempt,
                         "delivery_mode": delivery_mode,
+                        "response_received_at_ms": round(response_received_at * 1000),
                         "response": response.text[:500]
                     })
                     return timely
