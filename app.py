@@ -16,7 +16,7 @@ from signal_protocol import ReferenceSignals
 
 app = Flask(__name__)
 
-APP_VERSION = "discord v26 shared delivery budget"
+APP_VERSION = "discord v27 late entry information"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")

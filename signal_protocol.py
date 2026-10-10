@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 
 JST = ZoneInfo("Asia/Tokyo")
 MAX_ENTRY_AGE = 5
+MAX_LATE_NOTICE_AGE = 15
+DELIVERY_POLICY_REVISION = "late_entry_info_20261010"
 PREVIEW_SECONDS = 60
 EXPIRY_SECONDS = 300
 RESULT_GRACE_SECONDS = 90
@@ -142,7 +144,8 @@ class ReferenceSignals:
         is_test = data.get("test") is True or str(data.get("ticker", "")).startswith("TEST:")
         prefix = "🧪【テスト・注文禁止】\n" if is_test else ""
         icon = {"エントリー予告": "🔔", "確定エントリー": "✅", "エントリー中止": "⛔",
-                "5分参考判定": "📊", "参考判定未取得": "⚠️"}.get(title, "ℹ️")
+                "5分参考判定": "📊", "参考判定未取得": "⚠️",
+                "遅延エントリー情報": "⚠️"}.get(title, "ℹ️")
         pair = "USD/JPY" if data["pair"] == "USDJPY" else "BTC/USD"
         direction = "上" if data["signal"] == "HIGH" else "下"
         arrow = "⬆️" if data["signal"] == "HIGH" else "⬇️"
@@ -164,7 +167,8 @@ class ReferenceSignals:
 
     def cancel(self, data, reason):
         previous = self.load(data["event_id"])
-        if previous and previous["state"] in ("CANCELLED", "CANCEL_PENDING", "ENTERED", "RESULT", "UNKNOWN_RESULT"):
+        if previous and previous["state"] in ("CANCELLED", "CANCEL_PENDING", "ENTERED", "RESULT", "UNKNOWN_RESULT",
+                                               "LATE_SENDING", "LATE_ENTRY"):
             return {"status": "skipped", "reason": "terminal_state"}
         # Persist the tombstone before transport so delayed entries cannot revive it.
         data = dict(data, cancel_reason=reason)
@@ -177,6 +181,39 @@ class ReferenceSignals:
         self.save(data, "CANCELLED" if sent else "CANCEL_PENDING", 0 if sent else self.clock() + 30)
         self.record(data, "CANCELLED", notification_sent=sent, reason=reason)
         return {"status": "cancelled", "notification_sent": sent, "reason": reason}
+
+    def late_or_cancel(self, data, state, reason, normal_delivery_attempted=False):
+        now = self.clock()
+        entry = data["entry_time_ms"] / 1000
+        deadline = entry + MAX_LATE_NOTICE_AGE
+        preview = data["preview_started_ms"] / 1000
+        if preview:
+            deadline = min(deadline, preview + PREVIEW_SECONDS)
+        if state:
+            deadline = min(deadline, state["deadline"])
+        if now < entry + MAX_ENTRY_AGE or now >= deadline:
+            return self.cancel(data, reason)
+        data = dict(data, informational_only=True, accepted_entry=False,
+                    late_notice_reason=reason, late_notice_deadline_ms=round(deadline * 1000),
+                    late_notice_delay_seconds=round(now - entry, 3),
+                    normal_delivery_attempted=normal_delivery_attempted,
+                    prior_normal_delivery_timing=(dict(data["server_timing"])
+                                                  if normal_delivery_attempted else None))
+        # A late notice is terminal information, never a revived or accepted ENTRY.
+        self.save(data, "LATE_SENDING", deadline)
+        body = (f"基準時刻から {now - entry:.1f}秒遅延（サーバー作成時点）。\n"
+                "通常の5秒期限は超過しています。入るかどうかは自己判断です。\n"
+                f"⌛ 遅延情報の送信期限: {stamp(deadline)}\n"
+                "到着までにさらに遅れる場合があります。参考価格は現在の価格ではありません。\n"
+                "実際の受付価格・判定時刻を確認してください。\n"
+                "この遅延情報は通常のエントリー・参考勝率集計に含めず、結果通知も行いません。")
+        if normal_delivery_attempted:
+            body += "\n先行する通常通知の配信は未確認です。同じIDで重ねてエントリーしないでください。"
+        sent = self.deliver(data, self.message(data, "遅延エントリー情報", body), deadline_ts=deadline)
+        self.save(data, "LATE_ENTRY")
+        self.record(data, "LATE_ENTRY", notification_sent=sent)
+        return {"status": "late_entry_information", "notification_sent": sent,
+                "accepted_entry": False, "reason": reason}
 
     def handle(self, raw, allowed=True, received_at=None):
         started = self.clock()
@@ -203,6 +240,7 @@ class ReferenceSignals:
                 "worker_queue_seconds": round(max(0, started - received_at), 3),
                 "state_lock_wait_seconds": round(max(0, now - started), 3),
             }
+            data["server_delivery_revision"] = DELIVERY_POLICY_REVISION
             if emitted > now + 1 or now - emitted > 86400:
                 return {"status": "rejected", "reason": "invalid_event_clock"}
             if notice == "PRE_ENTRY_CANCEL":
@@ -245,7 +283,7 @@ class ReferenceSignals:
                     or (preview and preview < self.started_at and not state)):
                 return self.cancel(data, "再起動前の予告、または時刻が不整合のため中止")
             if now >= deadline:
-                return self.cancel(data, "5秒の配信期限、または予告60秒の期限を超過")
+                return self.late_or_cancel(data, state, "5秒の配信期限、または予告60秒の期限を超過")
             # SENDING is fail-closed if the worker dies during an ambiguous HTTP request.
             self.save(data, "SENDING", deadline)
             sent = self.deliver(data, self.message(data, "確定エントリー",
@@ -254,7 +292,8 @@ class ReferenceSignals:
                             f"🏁 5分判定基準: {stamp(entry + EXPIRY_SECONDS)}\n"
                             "業者の受付価格・判定時刻を必ず確認してください。"), deadline_ts=deadline)
             if not sent:
-                return self.cancel(data, "期限内の配信を確認できませんでした。エントリーしないでください")
+                return self.late_or_cancel(data, state, "期限内の配信を確認できませんでした。エントリーしないでください",
+                                           normal_delivery_attempted=True)
             self.save(data, "ENTERED", entry + EXPIRY_SECONDS + RESULT_GRACE_SECONDS)
             self.record(data, "ENTRY", notification_sent=True, delay_seconds=round(now - entry, 3))
             return {"status": "entered", "notification_sent": True}
@@ -276,9 +315,9 @@ class ReferenceSignals:
         return {"status": "result", "reference_result": outcome, "notification_sent": sent}
 
     def sweep(self):
-        active_states = ("PENDING", "SENDING", "ENTERED", "CANCEL_PENDING")
+        active_states = ("PENDING", "SENDING", "ENTERED", "CANCEL_PENDING", "LATE_SENDING")
         with self.db() as db:
-            rows = db.execute("SELECT id FROM signals WHERE state IN ('PENDING', 'SENDING', 'ENTERED', 'CANCEL_PENDING') AND deadline<=?",
+            rows = db.execute("SELECT id FROM signals WHERE state IN ('PENDING', 'SENDING', 'ENTERED', 'CANCEL_PENDING', 'LATE_SENDING') AND deadline<=?",
                               (self.clock(),)).fetchall()
         for item in rows:
             with self.serialized(item["id"], blocking=False) as acquired:
@@ -290,6 +329,10 @@ class ReferenceSignals:
                 data = row["data"]
                 if row["state"] == "CANCEL_PENDING":
                     self.deliver_cancel(data)
+                elif row["state"] == "LATE_SENDING":
+                    self.save(data, "LATE_ENTRY")
+                    self.record(data, "LATE_ENTRY", notification_sent=False,
+                                reason="late_delivery_interrupted_or_unconfirmed")
                 elif row["state"] in ("PENDING", "SENDING"):
                     self.cancel(data, "予告から60秒以内に確定通知が成立しませんでした")
                 else:
@@ -340,10 +383,13 @@ class ReferenceSignals:
             backlog = db.execute("SELECT COUNT(*) FROM audit WHERE exported=0").fetchone()[0]
             last = db.execute("SELECT data FROM audit ORDER BY created DESC LIMIT 1").fetchone()
         return {"schema_version": 2, "mode": "reference_validation", "max_entry_age_seconds": MAX_ENTRY_AGE,
+                "late_entry_information_max_age_seconds": MAX_LATE_NOTICE_AGE,
+                "late_entry_information_counts_as_entry": False,
+                "server_delivery_revision": DELIVERY_POLICY_REVISION,
                 "pre_entry_cancel_seconds": PREVIEW_SECONDS, "expiry_seconds": EXPIRY_SECONDS,
                 "states": counts, "archive_backlog": backlog, "archive_error": self.archive_error,
                 "worker_error": self.last_error, "actual_results": "unavailable",
                 "serialization": "event_shards_1024", "latency_instrumentation": True,
-                "message_format": "live_manual_emoji_v2", "notification_time_basis": "server_message_created",
+                "message_format": "live_manual_emoji_v3_late_info", "notification_time_basis": "server_message_created",
                 "last_server_timing": json.loads(last["data"]).get("server_timing") if last else None,
                 "state_storage": "local SQLite; not durable across Render redeploys"}
