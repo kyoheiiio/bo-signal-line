@@ -16,7 +16,7 @@ from signal_protocol import ReferenceSignals
 
 app = Flask(__name__)
 
-APP_VERSION = "discord v27 late entry information"
+APP_VERSION = "discord v28 BTC all-week notifications"
 
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -122,7 +122,7 @@ PAIR_SETTINGS = {
         "start_hour": 8,
         "end_hour": 5,
         "weekdays_only": False,
-        "weekends_only": True,
+        "weekends_only": False,
         "session_name": "theoption BTC/USD"
     }
 }
